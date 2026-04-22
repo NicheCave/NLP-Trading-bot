@@ -5,6 +5,15 @@ from loguru import logger
 from datetime import date
 import config
 from signal_generator import Signal
+from config import is_crypto
+from alpaca.data.historical.crypto import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoLatestBarRequest
+from config import is_crypto, to_order_symbol
+
+_crypto_client = CryptoHistoricalDataClient(
+    api_key=config.ALPACA_API_KEY,
+    secret_key=config.ALPACA_SECRET_KEY
+)
 
 # ── Connect to Alpaca API ─────────────────────────────────────
 api = tradeapi.REST(
@@ -34,10 +43,16 @@ def get_open_positions() -> list:
 
 def already_in_position(ticker: str) -> bool:
     try:
-        pos = api.get_position(ticker)
+        pos = api.get_position(to_order_symbol(ticker))
         return float(pos.qty) != 0
     except:
         return False
+
+def is_market_open(ticker: str) -> bool:
+    if is_crypto(ticker):
+        return True   # crypto never closes
+    clock = api.get_clock()
+    return clock.is_open
 
 def execute_signal(signal: Signal):
     """Execute a trade signal with full risk management checks."""
@@ -60,29 +75,49 @@ def execute_signal(signal: Signal):
         return
 
     if signal.action == 'BUY' and already_in_position(signal.ticker):
-        logger.info(f"Already holding {signal.ticker} — skipping duplicate BUY")
+        logger.debug(f"Already holding {signal.ticker} — cached BUY signal skipped")
         return
+
+    risk = config.CRYPTO_RISK_PER_TRADE if is_crypto(signal.ticker) else config.RISK_PER_TRADE
+    stop = config.CRYPTO_STOP_LOSS_PCT if is_crypto(signal.ticker) else config.STOP_LOSS_PCT
 
     # ── Position sizing ───────────────────────────────────────
-    portfolio  = get_portfolio_value()
-    price      = float(api.get_latest_trade(signal.ticker).price)
-    dollars    = portfolio * config.RISK_PER_TRADE * signal.confidence
-    qty        = int(dollars / price)
+    portfolio = get_portfolio_value()
 
-    if qty < 1:
-        logger.warning(f"Position size too small for {signal.ticker} — skipping")
-        return
+    if is_crypto(signal.ticker):
+        request = CryptoLatestBarRequest(symbol_or_symbols=signal.ticker)
+        bar = _crypto_client.get_crypto_latest_bar(request)
+        price = float(bar[signal.ticker].close)
+    else:
+        price = float(api.get_latest_trade(signal.ticker).price)
+
+    dollars    = portfolio * risk * signal.confidence
+
+    if is_crypto(signal.ticker):
+        # Crypto: use fractional qty, rounded to 6 decimal places
+        qty = round(dollars / price, 6)
+        qty_str = str(qty)
+        time_in_force = 'gtc'  # crypto orders must be GTC, not 'day'
+    else:
+        # Stocks: whole shares only
+        qty = int(dollars / price)
+        if qty < 1:
+            logger.warning(f"Position size too small for {signal.ticker} — skipping")
+            return
+        qty_str = str(qty)
+        time_in_force = 'day'
 
     side = 'buy' if signal.action == 'BUY' else 'sell'
 
+    order_symbol = to_order_symbol(signal.ticker)
     # ── Place the market order ────────────────────────────────
     try:
         order = api.submit_order(
-            symbol        = signal.ticker,
-            qty           = qty,
-            side          = side,
-            type          = 'market',
-            time_in_force = 'day'
+            symbol=order_symbol,  # ← changed
+            qty=qty_str,
+            side=side,
+            type='market',
+            time_in_force=time_in_force
         )
         _daily_trades += 1
         logger.success(
@@ -92,12 +127,18 @@ def execute_signal(signal: Signal):
 
         # ── Place stop-loss order ────────────────────────────────
         if signal.action == 'BUY':
-            stop_price = round(price * (1 - config.STOP_LOSS_PCT), 2)
+            stop_price = round(price * (1 - stop), 2)
             api.submit_order(
-                symbol=signal.ticker, qty=qty, side='sell',
-                type='stop', stop_price=stop_price, time_in_force='gtc'
+                symbol=order_symbol,  # ← changed
+                qty=qty_str,
+                side='sell',
+                type='stop',
+                stop_price=stop_price,
+                time_in_force='gtc'
             )
             logger.info(f"  Stop-loss set at ${stop_price}")
+
+
 
     except Exception as e:
         logger.error(f"Order failed for {signal.ticker}: {e}")

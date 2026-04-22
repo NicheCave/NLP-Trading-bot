@@ -18,12 +18,12 @@ _finnhub      = finnhub.Client(api_key=os.getenv('FINNHUB_API_KEY'))
 
 # ── Keyword map for NewsAPI (Finnhub uses ticker directly) ───
 TICKER_KEYWORDS = {
-    'TSLA': ['TSLA', 'Tesla'],
-    'NVDA': ['NVDA', 'Nvidia'],
-    'AAPL': ['AAPL', 'Apple stock'],
-    'MSFT': ['MSFT', 'Microsoft'],
-    'BTC':  ['Bitcoin', 'BTC'],
-    'ETH':  ['Ethereum', 'ETH'],
+    'TSLA':   ['TSLA', 'Tesla'],
+    'NVDA':   ['NVDA', 'Nvidia'],
+    'AAPL':   ['AAPL', 'Apple stock'],
+    'MSFT':   ['MSFT', 'Microsoft'],
+    'BTCUSD': ['Bitcoin', 'BTC'],
+    'ETHUSD': ['Ethereum', 'ETH'],
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -67,6 +67,13 @@ def fetch_news(ticker: str) -> list[str]:
 # Uses ticker directly — no keyword guessing needed.
 # Returns last 24h of news articles about that exact company.
 # ─────────────────────────────────────────────────────────────
+FINNHUB_SYMBOL_MAP = {
+    'BTCUSD': 'BINANCE:BTCUSDT',
+    'ETHUSD': 'BINANCE:ETHUSDT',
+}
+def _to_finnhub_symbol(ticker: str) -> str:
+    return FINNHUB_SYMBOL_MAP.get(ticker, ticker)
+
 def fetch_finnhub_news(ticker: str) -> list[FinnhubArticle]:
     """
     Fetch recent company-specific news from Finnhub.
@@ -77,8 +84,7 @@ def fetch_finnhub_news(ticker: str) -> list[FinnhubArticle]:
     yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
     try:
-        articles = _finnhub.company_news(ticker, _from=yesterday, to=today)
-
+        articles = _finnhub.company_news(_to_finnhub_symbol(ticker), _from=yesterday, to=today)
         result = []
         for a in articles[:config.FINNHUB_ARTICLES]:  # cap to avoid rate limits
             headline = a.get('headline', '').strip()

@@ -11,6 +11,12 @@ ALPACA_SECRET_KEY = os.getenv('ALPACA_SECRET_KEY')
 ALPACA_BASE_URL   = os.getenv('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets')
 NEWS_API_KEY      = os.getenv('NEWS_API_KEY')
 FINNHUB_ARTICLES = 20
+ALPACA_ORDER_SYMBOL = {
+    'BTCUSD': 'BTC/USD',
+    'ETHUSD': 'ETH/USD',
+    'SOLUSD': 'SOL/USD',
+    'DOGEUSD': 'DOGE/USD',
+}
 
 # ── Watchlist ─────────────────────────────────────────────────
 _raw = os.getenv('WATCHLIST', 'TSLA,NVDA,AAPL')
@@ -32,7 +38,24 @@ MAX_DAILY_TRADES = 5      # never trade more than 5x per day
 MAX_OPEN_POSITIONS = 3    # hold max 3 positions simultaneously
 
 # ── Schedule ──────────────────────────────────────────────────
-CHECK_INTERVAL   = 60     # run bot every 60 minutes
+CHECK_INTERVAL   = 3     # sentiment refresh — every 60 minutes
+EXECUTION_INTERVAL = 1   # order execution check — every 5 minutes
+CRYPTO_TICKERS = {'BTCUSD', 'ETHUSD', 'SOLUSD', 'DOGEUSD'}
+
+# Crypto-specific overrides
+CRYPTO_RISK_PER_TRADE  = 0.01   # half the stock allocation — crypto is riskier
+CRYPTO_STOP_LOSS_PCT   = 0.05   # wider stop — crypto swings hard
+CRYPTO_TAKE_PROFIT_PCT = 0.10
+CRYPTO_BUY_THRESHOLD  = 0.35   # 35% bulls enough (vs 65% for stocks)
+CRYPTO_MIN_AVG_SCORE  = 0.10   # lower bar (vs 0.18 for stocks)
+CRYPTO_SELL_THRESHOLD = 0.30
+
+def is_crypto(ticker: str) -> bool:
+    return ticker in CRYPTO_TICKERS
+
+def to_order_symbol(ticker: str) -> str:
+    """Convert internal ticker to Alpaca order format."""
+    return ALPACA_ORDER_SYMBOL.get(ticker, ticker)
 
 # ── GPU: auto-detect — FinBERT uses GPU if available ──────────
 import torch
