@@ -10,9 +10,7 @@ ALPACA_API_KEY    = os.getenv('ALPACA_API_KEY')
 ALPACA_SECRET_KEY = os.getenv('ALPACA_SECRET_KEY')
 ALPACA_BASE_URL   = os.getenv('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets')
 NEWS_API_KEY      = os.getenv('NEWS_API_KEY')
-REDDIT_CLIENT_ID  = os.getenv('REDDIT_CLIENT_ID')
-REDDIT_CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET')
-REDDIT_USER_AGENT = os.getenv('REDDIT_USER_AGENT', 'SentimentBot/1.0')
+FINNHUB_ARTICLES = 20
 
 # ── Watchlist ─────────────────────────────────────────────────
 _raw = os.getenv('WATCHLIST', 'TSLA,NVDA,AAPL')
@@ -25,7 +23,6 @@ MIN_ARTICLES     = 8      # minimum articles required before making a decision
 MIN_AVG_SCORE    = 0.18   # minimum average sentiment strength to confirm signal
 MIN_CONFIDENCE   = 0.70   # FinBERT confidence threshold — ignore weak predictions
 NEWS_ARTICLES    = 15     # number of news headlines to fetch per ticker
-REDDIT_POSTS     = 20     # number of Reddit posts to fetch per ticker
 
 # ── Risk Management ───────────────────────────────────────────
 RISK_PER_TRADE   = 0.02   # max 2% of portfolio per trade

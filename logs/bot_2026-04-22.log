@@ -1,0 +1,27 @@
+2026-04-22 19:36:41.330 | INFO     | __main__:<module>:40 - 🤖 FinBERT Sentiment Bot starting...
+2026-04-22 19:36:41.331 | INFO     | __main__:<module>:41 -    Device: cuda
+2026-04-22 19:36:41.331 | INFO     | __main__:<module>:42 -    Watchlist: ['TSLA', 'NVDA', 'AAPL']
+2026-04-22 19:36:41.332 | INFO     | __main__:<module>:43 -    Interval: every 60 minutes
+2026-04-22 19:36:41.332 | INFO     | __main__:<module>:44 -    Paper trading: https://paper-api.alpaca.markets
+2026-04-22 19:36:41.332 | INFO     | __main__:run_cycle:23 - ════ Cycle start: 2026-04-22 19:36 ════
+2026-04-22 19:36:41.333 | INFO     | __main__:run_cycle:24 - Watchlist: TSLA, NVDA, AAPL
+2026-04-22 19:36:41.333 | INFO     | __main__:run_cycle:27 - ── Processing TSLA ──
+2026-04-22 19:36:42.022 | DEBUG    | data_fetcher:fetch_news:59 - NewsAPI → 14 headlines for TSLA
+2026-04-22 19:36:43.818 | DEBUG    | data_fetcher:fetch_finnhub_news:94 - Finnhub → 20 articles for TSLA
+2026-04-22 19:36:43.818 | INFO     | data_fetcher:fetch_all_text:142 - TSLA: 34 texts (14 NewsAPI + 20 Finnhub)
+2026-04-22 19:36:44.665 | INFO     | signal_generator:generate_signal:47 - TSLA: 34 articles | bulls=9% bears=24% avg_score=-0.135
+2026-04-22 19:36:44.666 | INFO     | executor:execute_signal:50 - HOLD TSLA — Mixed or insufficient sentiment strength
+2026-04-22 19:36:44.666 | INFO     | __main__:run_cycle:27 - ── Processing NVDA ──
+2026-04-22 19:36:45.308 | DEBUG    | data_fetcher:fetch_news:59 - NewsAPI → 15 headlines for NVDA
+2026-04-22 19:36:45.823 | DEBUG    | data_fetcher:fetch_finnhub_news:94 - Finnhub → 20 articles for NVDA
+2026-04-22 19:36:45.823 | INFO     | data_fetcher:fetch_all_text:142 - NVDA: 35 texts (15 NewsAPI + 20 Finnhub)
+2026-04-22 19:36:46.275 | INFO     | signal_generator:generate_signal:47 - NVDA: 35 articles | bulls=17% bears=9% avg_score=+0.069
+2026-04-22 19:36:46.275 | INFO     | executor:execute_signal:50 - HOLD NVDA — Mixed or insufficient sentiment strength
+2026-04-22 19:36:46.275 | INFO     | __main__:run_cycle:27 - ── Processing AAPL ──
+2026-04-22 19:36:46.966 | DEBUG    | data_fetcher:fetch_news:59 - NewsAPI → 15 headlines for AAPL
+2026-04-22 19:36:47.552 | DEBUG    | data_fetcher:fetch_finnhub_news:94 - Finnhub → 20 articles for AAPL
+2026-04-22 19:36:47.552 | INFO     | data_fetcher:fetch_all_text:142 - AAPL: 35 texts (15 NewsAPI + 20 Finnhub)
+2026-04-22 19:36:47.984 | INFO     | signal_generator:generate_signal:47 - AAPL: 35 articles | bulls=17% bears=14% avg_score=+0.016
+2026-04-22 19:36:47.985 | INFO     | executor:execute_signal:50 - HOLD AAPL — Mixed or insufficient sentiment strength
+2026-04-22 19:36:47.985 | INFO     | __main__:run_cycle:34 - ════ Cycle complete ════
+
