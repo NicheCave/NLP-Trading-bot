@@ -6,7 +6,7 @@ from loguru import logger
 from datetime import datetime
 import config
 from signal_generator import generate_signal
-from executor import execute_signal
+from executor import execute_signal, check_exits
 
 # ── Logging setup ─────────────────────────────────────────────
 logger.remove()
@@ -52,6 +52,8 @@ def execution_cycle():
         except Exception as e:
             logger.error(f"Execution error for {ticker}: {e}")
 
+    check_exits()
+
 
 # ── Schedule both loops independently ────────────────────────
 schedule.every(config.CHECK_INTERVAL).minutes.do(sentiment_cycle)
@@ -66,6 +68,7 @@ logger.info(f"   Paper trading: {config.ALPACA_BASE_URL}")
 
 # Run sentiment immediately on start to populate cache before first execution check
 sentiment_cycle()
+check_exits()
 
 while True:
     schedule.run_pending()

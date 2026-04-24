@@ -34,11 +34,11 @@ NEWS_ARTICLES    = 15     # number of news headlines to fetch per ticker
 RISK_PER_TRADE   = 0.02   # max 2% of portfolio per trade
 STOP_LOSS_PCT    = 0.03   # stop-loss at -3% below entry
 TAKE_PROFIT_PCT  = 0.06   # take-profit at +6% above entry
-MAX_DAILY_TRADES = 5      # never trade more than 5x per day
-MAX_OPEN_POSITIONS = 3    # hold max 3 positions simultaneously
+MAX_DAILY_TRADES = 10      # never trade more than 5x per day
+MAX_OPEN_POSITIONS = 5    # hold max 3 positions simultaneously
 
 # ── Schedule ──────────────────────────────────────────────────
-CHECK_INTERVAL   = 3     # sentiment refresh — every 60 minutes
+CHECK_INTERVAL   = 45     # sentiment refresh — every 60 minutes
 EXECUTION_INTERVAL = 1   # order execution check — every 5 minutes
 CRYPTO_TICKERS = {'BTCUSD', 'ETHUSD', 'SOLUSD', 'DOGEUSD'}
 
@@ -46,9 +46,9 @@ CRYPTO_TICKERS = {'BTCUSD', 'ETHUSD', 'SOLUSD', 'DOGEUSD'}
 CRYPTO_RISK_PER_TRADE  = 0.01   # half the stock allocation — crypto is riskier
 CRYPTO_STOP_LOSS_PCT   = 0.05   # wider stop — crypto swings hard
 CRYPTO_TAKE_PROFIT_PCT = 0.10
-CRYPTO_BUY_THRESHOLD  = 0.35   # 35% bulls enough (vs 65% for stocks)
-CRYPTO_MIN_AVG_SCORE  = 0.10   # lower bar (vs 0.18 for stocks)
-CRYPTO_SELL_THRESHOLD = 0.30
+CRYPTO_BUY_THRESHOLD  = 0.25   # 35% bulls enough (vs 65% for stocks)
+CRYPTO_MIN_AVG_SCORE  = 0.06   # lower bar (vs 0.18 for stocks)
+CRYPTO_SELL_THRESHOLD = 0.22
 
 def is_crypto(ticker: str) -> bool:
     return ticker in CRYPTO_TICKERS

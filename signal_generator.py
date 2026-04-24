@@ -49,7 +49,9 @@ def generate_signal(ticker: str) -> Signal:
     min_avg_score  = config.CRYPTO_MIN_AVG_SCORE  if is_crypto(ticker) else config.MIN_AVG_SCORE
 
     if bull_pct >= buy_threshold and avg_score >= min_avg_score:
-        return Signal(ticker, 'BUY', bull_pct, avg_score, bull_pct, bear_pct, total,
+        # Use avg_score as confidence proxy, clamped to 0.3–1.0
+        confidence = min(1.0, max(0.3, avg_score * 3))
+        return Signal(ticker, 'BUY', confidence, avg_score, bull_pct, bear_pct, total,
                       f"{bull_pct:.0%} bullish articles, avg score={avg_score:+.3f}")
 
     elif bear_pct >= sell_threshold and avg_score <= -min_avg_score:
