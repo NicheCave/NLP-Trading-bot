@@ -34,12 +34,13 @@ NEWS_ARTICLES    = 15     # number of news headlines to fetch per ticker
 RISK_PER_TRADE   = 0.02   # max 2% of portfolio per trade
 STOP_LOSS_PCT    = 0.03   # stop-loss at -3% below entry
 TAKE_PROFIT_PCT  = 0.06   # take-profit at +6% above entry
-MAX_DAILY_TRADES = 10      # never trade more than 5x per day
+MAX_DAILY_TRADES_STOCKS = 4   # stay under PDT threshold
+MAX_DAILY_TRADES_CRYPTO = 40  # crypto has no PDT rule, be more generous
 MAX_OPEN_POSITIONS = 5    # hold max 3 positions simultaneously
 
 # ── Schedule ──────────────────────────────────────────────────
-CHECK_INTERVAL   = 45     # sentiment refresh — every 60 minutes
-EXECUTION_INTERVAL = 1   # order execution check — every 5 minutes
+CHECK_INTERVAL   = 35     # sentiment refresh — every 60 minutes
+EXECUTION_INTERVAL = 45   # order execution check — every 5 minutes
 CRYPTO_TICKERS = {'BTCUSD', 'ETHUSD', 'SOLUSD', 'DOGEUSD'}
 
 # Crypto-specific overrides

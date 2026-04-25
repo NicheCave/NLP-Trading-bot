@@ -160,8 +160,9 @@ def execute_signal(signal: Signal):
         logger.info(f"HOLD {signal.ticker} — {signal.reason}")
         return
 
-    if signal.action == 'BUY' and _daily_trades >= config.MAX_DAILY_TRADES:
-        logger.warning("Daily trade limit reached — skipping BUY")
+    limit = config.MAX_DAILY_TRADES_CRYPTO if is_crypto(signal.ticker) else config.MAX_DAILY_TRADES_STOCKS
+    if signal.action == 'BUY' and _daily_trades >= limit:
+        logger.warning(f"Daily trade limit ({limit}) reached — skipping BUY for {signal.ticker}")
         return
 
     open_positions = get_open_positions()
@@ -225,7 +226,8 @@ def execute_signal(signal: Signal):
     if signal.action == 'SELL':
         try:
             pos = api.get_position(signal.ticker)
-            qty_clean = str(float(pos.qty))
+            qty_str = str(float(pos.qty))
+            time_in_force = 'gtc'
             logger.info(f"Closing full position: {qty_str} {order_symbol}")
         except Exception as e:
             logger.error(f"Could not fetch position qty for SELL {signal.ticker}: {e}")

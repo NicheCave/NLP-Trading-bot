@@ -5,7 +5,7 @@ import sys
 from loguru import logger
 from datetime import datetime
 import config
-from signal_generator import generate_signal
+from signal_generator import generate_signal, Signal
 from executor import execute_signal, check_exits
 
 # ── Logging setup ─────────────────────────────────────────────
@@ -44,11 +44,24 @@ def execution_cycle():
 
     logger.info(f"── Execution check: {datetime.now().strftime('%H:%M')} ──")
 
-    for ticker, signal in _cached_signals.items():
+    for ticker, signal in list(_cached_signals.items()):  # list() so we can modify during iteration
         try:
             if signal.action != 'HOLD':
                 logger.info(f"Acting on cached signal: {ticker} → {signal.action}")
-            execute_signal(signal)
+            if signal.action == 'SELL':
+                from executor import already_in_position
+                execute_signal(signal)
+                # Only clear if position is actually gone now
+                if not already_in_position(ticker):
+                    _cached_signals[ticker] = Signal(
+                        ticker, 'HOLD', 0.0, 0.0, 0.0, 0.0, 0,
+                        "Post-sell hold — waiting for next sentiment cycle"
+                    )
+                    logger.info(f"Signal cleared for {ticker} — position closed")
+                else:
+                    logger.warning(f"SELL for {ticker} may have failed — keeping SELL signal")
+            else:
+                execute_signal(signal)
         except Exception as e:
             logger.error(f"Execution error for {ticker}: {e}")
 
@@ -57,7 +70,7 @@ def execution_cycle():
 
 # ── Schedule both loops independently ────────────────────────
 schedule.every(config.CHECK_INTERVAL).minutes.do(sentiment_cycle)
-schedule.every(config.EXECUTION_INTERVAL).minutes.do(execution_cycle)
+schedule.every(config.EXECUTION_INTERVAL).seconds.do(execution_cycle)
 
 logger.info("🤖 FinBERT Sentiment Bot starting...")
 logger.info(f"   Device:      {config.DEVICE}")

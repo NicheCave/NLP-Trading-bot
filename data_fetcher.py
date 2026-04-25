@@ -83,6 +83,9 @@ def fetch_finnhub_news(ticker: str) -> list[FinnhubArticle]:
     today     = datetime.now().strftime('%Y-%m-%d')
     yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
+    if config.is_crypto(ticker):
+        return []
+
     try:
         articles = _finnhub.company_news(_to_finnhub_symbol(ticker), _from=yesterday, to=today)
         result = []
