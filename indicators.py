@@ -1,16 +1,9 @@
-# indicators.py — pure technical indicator functions + SMC detectors
+# indicators.py — all technical indicator functions (core TA + SMC + v3 Advanced TA)
 # ─────────────────────────────────────────────────────────────
-# All functions take a pandas DataFrame (OHLCV) and return
-# a scalar or small dict — no side effects, no state.
-#
-# Changes from v1:
-#   - MACD: fixed divergence to require zero-line cross, not just histogram expansion
-#   - RSI:  fixed neutral zone — bearish_zone now casts 0 vote (not -0.5)
-#   - trend_structure: extended regression window from 30 → 80 bars for daily use
-#   - NEW: order_blocks()       — institutional OB detection
-#   - NEW: fair_value_gaps()    — FVG / imbalance detection
-#   - NEW: break_of_structure() — BOS / CHoCH event detection
-#   - NEW: liquidity_sweep()    — stop-hunt detection
+# Core TA  : ema_cross, rsi, macd, bollinger_bands, atr
+# SMC      : order_block, fair_value_gap, bos_choch, liquidity_sweep
+# v3 Adv TA: avwap_pinch, alligator, awesome_oscillator, fractals,
+#             volume_relative, trap_detector, elliott_divergence
 # ─────────────────────────────────────────────────────────────
 import pandas as pd
 import numpy as np
@@ -18,622 +11,827 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
-# ──────────────────────────────────────────────────────────────
-# TREND INDICATORS
-# ──────────────────────────────────────────────────────────────
-
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(period).mean()
-
+# ══════════════════════════════════════════════════════════════
+# CORE TA — EMA CROSS
+# ══════════════════════════════════════════════════════════════
 
 @dataclass
-class EMASignal:
-    fast: float
-    slow: float
-    cross: str        # 'golden' | 'death' | 'above' | 'below'
-    slope_pct: float  # % change of fast EMA over last 3 bars
+class EMACrossResult:
+    fast_val:       float
+    slow_val:       float
+    fast_above_slow: bool
+    cross_up:       bool   # fast crossed above slow on this bar
+    cross_down:     bool   # fast crossed below slow on this bar
 
 
-def ema_cross(df: pd.DataFrame, fast: int = 9, slow: int = 21) -> Optional[EMASignal]:
-    if len(df) < slow + 5:
+def ema_cross(df: pd.DataFrame, fast: int = 9, slow: int = 21) -> Optional[EMACrossResult]:
+    if len(df) < slow + 2:
         return None
     close = df['close']
-    f = ema(close, fast)
-    s = ema(close, slow)
+    fast_ema = close.ewm(span=fast, adjust=False).mean()
+    slow_ema = close.ewm(span=slow, adjust=False).mean()
 
-    prev_above = f.iloc[-2] > s.iloc[-2]
-    curr_above = f.iloc[-1] > s.iloc[-1]
+    curr_fast = float(fast_ema.iloc[-1])
+    curr_slow = float(slow_ema.iloc[-1])
+    prev_fast = float(fast_ema.iloc[-2])
+    prev_slow = float(slow_ema.iloc[-2])
 
-    if not prev_above and curr_above:
-        cross = 'golden'
-    elif prev_above and not curr_above:
-        cross = 'death'
-    elif curr_above:
-        cross = 'above'
-    else:
-        cross = 'below'
+    cross_up   = prev_fast <= prev_slow and curr_fast > curr_slow
+    cross_down = prev_fast >= prev_slow and curr_fast < curr_slow
 
-    slope_pct = (f.iloc[-1] - f.iloc[-4]) / f.iloc[-4] * 100 if f.iloc[-4] != 0 else 0.0
-
-    return EMASignal(fast=float(f.iloc[-1]), slow=float(s.iloc[-1]),
-                     cross=cross, slope_pct=slope_pct)
-
-
-@dataclass
-class MACDResult:
-    macd: float       # MACD line value
-    signal: float     # signal line value
-    hist: float       # histogram (macd - signal)
-    prev_hist: float  # previous bar histogram
-    divergence: str   # 'bullish_cross' | 'bearish_cross' | 'bullish' | 'bearish' | 'neutral'
-    # FIX: divergence now requires zero-line cross for _cross variants;
-    #      plain 'bullish'/'bearish' = histogram expanding on correct side (weaker signal)
-
-
-def macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> Optional[MACDResult]:
-    if len(df) < slow + signal + 5:
-        return None
-    close = df['close']
-    macd_line   = ema(close, fast) - ema(close, slow)
-    signal_line = ema(macd_line, signal)
-    hist        = macd_line - signal_line
-
-    h_curr  = hist.iloc[-1]
-    h_prev  = hist.iloc[-2]
-    h_prev2 = hist.iloc[-3] if len(hist) >= 3 else h_prev
-
-    # Primary: zero-line cross (strongest signal — MACD line crosses signal line)
-    if h_prev <= 0 and h_curr > 0:
-        divergence = 'bullish_cross'
-    elif h_prev >= 0 and h_curr < 0:
-        divergence = 'bearish_cross'
-    # Secondary: histogram expanding in the correct direction (momentum confirmation)
-    elif h_curr > 0 and h_curr > h_prev > h_prev2:
-        divergence = 'bullish'
-    elif h_curr < 0 and h_curr < h_prev < h_prev2:
-        divergence = 'bearish'
-    else:
-        divergence = 'neutral'
-
-    return MACDResult(
-        macd=float(macd_line.iloc[-1]),
-        signal=float(signal_line.iloc[-1]),
-        hist=float(h_curr),
-        prev_hist=float(h_prev),
-        divergence=divergence,
+    return EMACrossResult(
+        fast_val=curr_fast,
+        slow_val=curr_slow,
+        fast_above_slow=curr_fast > curr_slow,
+        cross_up=cross_up,
+        cross_down=cross_down,
     )
 
 
-# ──────────────────────────────────────────────────────────────
-# MOMENTUM INDICATORS
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# CORE TA — RSI
+# ══════════════════════════════════════════════════════════════
 
 @dataclass
 class RSIResult:
     value: float
-    zone: str  # 'oversold' | 'overbought' | 'bullish_zone' | 'bearish_zone' | 'neutral'
-    # FIX: 'neutral' is now used for RSI 45–55 (truly flat); bearish_zone no longer
-    #      auto-votes -1 in market_analyzer — it casts 0 (see market_analyzer.py).
+    prev_value: float
 
 
 def rsi(df: pd.DataFrame, period: int = 14) -> Optional[RSIResult]:
     if len(df) < period + 2:
         return None
-    close    = df['close']
-    delta    = close.diff()
-    gain     = delta.clip(lower=0)
-    loss     = (-delta).clip(lower=0)
+    close = df['close']
+    delta = close.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
     avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
     avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
-    rs       = avg_gain / avg_loss.replace(0, np.nan)
-    rsi_val  = float((100 - 100 / (1 + rs)).iloc[-1])
-
-    if rsi_val <= 30:
-        zone = 'oversold'
-    elif rsi_val >= 70:
-        zone = 'overbought'
-    elif rsi_val >= 55:
-        zone = 'bullish_zone'
-    elif rsi_val <= 45:
-        zone = 'bearish_zone'
-    else:
-        zone = 'neutral'   # 45–55: genuinely flat, cast no vote
-
-    return RSIResult(value=rsi_val, zone=zone)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi_series = 100 - 100 / (1 + rs)
+    return RSIResult(
+        value=float(rsi_series.iloc[-1]),
+        prev_value=float(rsi_series.iloc[-2]),
+    )
 
 
-# ──────────────────────────────────────────────────────────────
-# VOLATILITY INDICATORS
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# CORE TA — MACD
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class MACDResult:
+    macd_line:  float
+    signal_line: float
+    histogram:  float
+    cross_up:   bool
+    cross_down: bool
+
+
+def macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> Optional[MACDResult]:
+    if len(df) < slow + signal + 2:
+        return None
+    close = df['close']
+    ema_fast   = close.ewm(span=fast,   adjust=False).mean()
+    ema_slow   = close.ewm(span=slow,   adjust=False).mean()
+    macd_line  = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram  = macd_line - signal_line
+
+    curr_macd = float(macd_line.iloc[-1])
+    curr_sig  = float(signal_line.iloc[-1])
+    prev_macd = float(macd_line.iloc[-2])
+    prev_sig  = float(signal_line.iloc[-2])
+
+    cross_up   = prev_macd <= prev_sig and curr_macd > curr_sig
+    cross_down = prev_macd >= prev_sig and curr_macd < curr_sig
+
+    return MACDResult(
+        macd_line=curr_macd,
+        signal_line=curr_sig,
+        histogram=float(histogram.iloc[-1]),
+        cross_up=cross_up,
+        cross_down=cross_down,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# CORE TA — BOLLINGER BANDS
+# ══════════════════════════════════════════════════════════════
 
 @dataclass
 class BollingerResult:
-    upper: float
+    upper:  float
     middle: float
-    lower: float
-    width_pct: float      # band width as % of middle
-    price_position: float # 0.0 = at lower band, 1.0 = at upper band
-    signal: str           # 'squeeze' | 'breakout_up' | 'breakout_down' | 'normal'
+    lower:  float
+    width:  float   # (upper - lower) / middle * 100
 
 
-def bollinger_bands(df: pd.DataFrame, period: int = 20,
-                    std_dev: float = 2.0) -> Optional[BollingerResult]:
+def bollinger_bands(df: pd.DataFrame, period: int = 20, std: float = 2.0) -> Optional[BollingerResult]:
     if len(df) < period + 2:
         return None
-    close = df['close']
-    mid   = sma(close, period)
-    std   = close.rolling(period).std()
-    upper = mid + std_dev * std
-    lower = mid - std_dev * std
+    close  = df['close']
+    middle = close.rolling(period).mean()
+    stddev = close.rolling(period).std()
+    upper  = middle + std * stddev
+    lower  = middle - std * stddev
 
-    w_pct = float((upper.iloc[-1] - lower.iloc[-1]) / mid.iloc[-1] * 100)
-    price = close.iloc[-1]
-    band_range = upper.iloc[-1] - lower.iloc[-1]
-    pos = float((price - lower.iloc[-1]) / band_range) if band_range != 0 else 0.5
+    mid_val = float(middle.iloc[-1])
+    up_val  = float(upper.iloc[-1])
+    lo_val  = float(lower.iloc[-1])
 
-    if w_pct < 4.0:
-        sig = 'squeeze'
-    elif price > upper.iloc[-1]:
-        sig = 'breakout_up'
-    elif price < lower.iloc[-1]:
-        sig = 'breakout_down'
-    else:
-        sig = 'normal'
+    width = (up_val - lo_val) / mid_val * 100 if mid_val != 0 else 0.0
 
-    return BollingerResult(
-        upper=float(upper.iloc[-1]),
-        middle=float(mid.iloc[-1]),
-        lower=float(lower.iloc[-1]),
-        width_pct=w_pct,
-        price_position=pos,
-        signal=sig,
-    )
+    return BollingerResult(upper=up_val, middle=mid_val, lower=lo_val, width=width)
 
+
+# ══════════════════════════════════════════════════════════════
+# CORE TA — ATR
+# ══════════════════════════════════════════════════════════════
 
 @dataclass
 class ATRResult:
-    value: float   # Average True Range ($)
-    pct: float     # ATR as % of close
-    regime: str    # 'low' | 'normal' | 'high'
+    value: float
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> Optional[ATRResult]:
-    if len(df) < period + 5:
+    if len(df) < period + 2:
         return None
-    high       = df['high']
-    low        = df['low']
-    close      = df['close']
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low  - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    atr_series      = tr.ewm(com=period - 1, adjust=False).mean()
-    atr_val         = float(atr_series.iloc[-1])
-    pct             = atr_val / float(close.iloc[-1]) * 100
-    recent_atr_avg  = float(atr_series.tail(50).mean())
-
-    if atr_val < recent_atr_avg * 0.75:
-        regime = 'low'
-    elif atr_val > recent_atr_avg * 1.5:
-        regime = 'high'
-    else:
-        regime = 'normal'
-
-    return ATRResult(value=atr_val, pct=pct, regime=regime)
-
-
-# ──────────────────────────────────────────────────────────────
-# VOLUME INDICATORS
-# ──────────────────────────────────────────────────────────────
-
-@dataclass
-class VolumeResult:
-    current: float
-    avg_20: float
-    ratio: float   # current / avg_20
-    spike: bool    # True if ratio >= 1.5
-    direction: str # 'bullish' | 'bearish' | 'neutral' — based on candle close vs open
-    # FIX: volume now carries its own direction, independent of EMA state
-
-
-def volume_analysis(df: pd.DataFrame) -> Optional[VolumeResult]:
-    if 'volume' not in df.columns or len(df) < 21:
-        return None
-    vol   = df['volume']
-    avg   = float(vol.rolling(20).mean().iloc[-1])
-    curr  = float(vol.iloc[-1])
-    ratio = curr / avg if avg > 0 else 1.0
-
-    # Determine direction from the candle itself (not from EMA state)
-    last_open  = float(df['open'].iloc[-1])
-    last_close = float(df['close'].iloc[-1])
-    if last_close > last_open * 1.001:
-        direction = 'bullish'
-    elif last_close < last_open * 0.999:
-        direction = 'bearish'
-    else:
-        direction = 'neutral'
-
-    return VolumeResult(current=curr, avg_20=avg, ratio=ratio,
-                        spike=ratio >= 1.5, direction=direction)
-
-
-# ──────────────────────────────────────────────────────────────
-# SWING LEVEL DETECTION
-# ──────────────────────────────────────────────────────────────
-
-@dataclass
-class SwingLevel:
-    level: float
-    label: str         # 'support' | 'resistance'
-    distance_pct: float
-    direction: str     # 'above' | 'below'
-
-
-def detect_swing_levels(df: pd.DataFrame, lookback: int = 50) -> list[SwingLevel]:
-    if len(df) < lookback:
-        return []
-
-    close   = df['close']
-    high    = df['high']
-    low     = df['low']
-    current = float(close.iloc[-1])
-    window  = 5
-    levels  = []
-
-    for i in range(window, len(df) - window):
-        if all(high.iloc[i] >= high.iloc[i - j] for j in range(1, window + 1)) and \
-           all(high.iloc[i] >= high.iloc[i + j] for j in range(1, window + 1)):
-            lvl = float(high.iloc[i])
-            levels.append(SwingLevel(
-                level=lvl, label='resistance',
-                distance_pct=abs(lvl - current) / current * 100,
-                direction='above' if lvl > current else 'below',
-            ))
-
-        if all(low.iloc[i] <= low.iloc[i - j] for j in range(1, window + 1)) and \
-           all(low.iloc[i] <= low.iloc[i + j] for j in range(1, window + 1)):
-            lvl = float(low.iloc[i])
-            levels.append(SwingLevel(
-                level=lvl, label='support',
-                distance_pct=abs(lvl - current) / current * 100,
-                direction='below' if lvl < current else 'above',
-            ))
-
-    merged = []
-    for lvl in sorted(levels, key=lambda x: x.level):
-        if not merged or abs(lvl.level - merged[-1].level) / merged[-1].level > 0.01:
-            merged.append(lvl)
-
-    supports = sorted([l for l in merged if l.label == 'support'],   key=lambda x: x.distance_pct)[:3]
-    resists  = sorted([l for l in merged if l.label == 'resistance'], key=lambda x: x.distance_pct)[:3]
-    return supports + resists
-
-
-# ──────────────────────────────────────────────────────────────
-# FIBONACCI RETRACEMENTS
-# ──────────────────────────────────────────────────────────────
-
-FIBO_LEVELS = [0.236, 0.382, 0.5, 0.618, 0.786]
-
-
-@dataclass
-class FiboResult:
-    swing_high: float
-    swing_low: float
-    levels: dict         # ratio -> price level
-    nearest_level: float # ratio of nearest fib
-    nearest_price: float # price of that fib level
-    distance_pct: float  # % distance from current price to nearest fib
-    at_support: bool     # True if price is near a fib AND below it (fib acting as resistance-turned-support)
-    at_resistance: bool  # True if price is near a fib AND above it
-
-
-def fibonacci_retracements(df: pd.DataFrame, lookback: int = 100) -> Optional[FiboResult]:
-    """
-    FIX: Previously the support/resistance logic was inverted.
-    Now correctly identifies whether price is approaching a fib from below
-    (resistance) or has pulled back to a fib from above (support).
-    """
-    if len(df) < lookback:
-        return None
-
-    window     = df.tail(lookback)
-    swing_high = float(window['high'].max())
-    swing_low  = float(window['low'].min())
-    current    = float(df['close'].iloc[-1])
-    rng        = swing_high - swing_low
-
-    if rng == 0:
-        return None
-
-    # Fib levels are retracements FROM high DOWN toward low
-    # fib_price = swing_high - ratio * range
-    # So ratio=0.382 → price is 38.2% of the way down from the high
-    levels = {ratio: swing_high - ratio * rng for ratio in FIBO_LEVELS}
-
-    nearest       = min(FIBO_LEVELS, key=lambda r: abs(levels[r] - current))
-    nearest_price = levels[nearest]
-    distance_pct  = abs(nearest_price - current) / current * 100
-
-    # Price is BELOW the fib level → fib is acting as resistance above
-    # Price is ABOVE the fib level → price has retraced to fib and may bounce (support)
-    at_support    = current >= nearest_price and distance_pct < 2.0
-    at_resistance = current < nearest_price  and distance_pct < 2.0
-
-    return FiboResult(
-        swing_high=swing_high,
-        swing_low=swing_low,
-        levels=levels,
-        nearest_level=nearest,
-        nearest_price=nearest_price,
-        distance_pct=distance_pct,
-        at_support=at_support,
-        at_resistance=at_resistance,
-    )
-
-
-# ──────────────────────────────────────────────────────────────
-# TREND STRUCTURE
-# FIX: regression window extended from 30 → 80 bars for daily charts
-# ──────────────────────────────────────────────────────────────
-
-@dataclass
-class TrendStructure:
-    direction: str    # 'uptrend' | 'downtrend' | 'ranging'
-    strength: float   # R² — 0.0 (weak) to 1.0 (strong)
-    higher_highs: bool
-    higher_lows: bool
-    channel_break: str  # 'broke_above' | 'broke_below' | 'none'
-
-
-def trend_structure(df: pd.DataFrame, pivots: int = 5,
-                    regression_bars: int = 80) -> Optional[TrendStructure]:
-    """
-    FIX: regression_bars default raised to 80 (was 30).
-    On a daily chart 30 bars = 30 days — too short to identify a major trend.
-    80 bars = ~3 months, which captures real market structure cycles.
-    """
-    n = min(regression_bars, len(df))
-    if n < 10:
-        return None
-
-    close = df['close']
-    x     = np.arange(n)
-    y     = close.iloc[-n:].values
-
-    coeffs = np.polyfit(x, y, 1)
-    slope  = coeffs[0]
-    y_pred = coeffs[0] * x + coeffs[1]
-    ss_res = np.sum((y - y_pred) ** 2)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    r2     = float(1 - ss_res / ss_tot) if ss_tot != 0 else 0.0
-
-    highs = df['high'].rolling(3).max().dropna().iloc[-pivots:]
-    lows  = df['low'].rolling(3).min().dropna().iloc[-pivots:]
-    hh    = bool(highs.is_monotonic_increasing)
-    hl    = bool(lows.is_monotonic_increasing)
-
-    if slope > 0 and r2 > 0.5:
-        direction = 'uptrend'
-    elif slope < 0 and r2 > 0.5:
-        direction = 'downtrend'
-    else:
-        direction = 'ranging'
-
-    return TrendStructure(
-        direction=direction,
-        strength=r2,
-        higher_highs=hh,
-        higher_lows=hl,
-        channel_break='none',
-    )
+    high  = df['high']
+    low   = df['low']
+    prev  = df['close'].shift(1)
+    tr    = pd.concat([(high - low),
+                       (high - prev).abs(),
+                       (low  - prev).abs()], axis=1).max(axis=1)
+    atr_val = float(tr.ewm(com=period - 1, adjust=False).mean().iloc[-1])
+    return ATRResult(value=atr_val)
 
 
 # ══════════════════════════════════════════════════════════════
-# SMART MONEY CONCEPTS (SMC) — new in v2
+# SMC — ORDER BLOCK
 # ══════════════════════════════════════════════════════════════
 
-# ──────────────────────────────────────────────────────────────
-# 1. ORDER BLOCKS
-# An order block is the last opposing candle before a significant
-# impulsive move. Institutions place limit orders here — price
-# tends to react strongly when it returns to these zones.
-# ──────────────────────────────────────────────────────────────
-
 @dataclass
-class OrderBlock:
-    ob_type: str        # 'bullish' | 'bearish'
-    top: float          # upper boundary of the OB
-    bottom: float       # lower boundary
-    mid: float          # midpoint
-    index: int          # bar index in df where the OB was formed
-    distance_pct: float # % from current price to OB mid
-    mitigated: bool     # True if price has already returned to the OB
+class OrderBlockResult:
+    bullish_ob:   bool
+    bearish_ob:   bool
+    bullish_level: float
+    bearish_level: float
+    near_bullish: bool   # price within proximity_pct of the OB
+    near_bearish: bool
 
 
-def order_blocks(df: pd.DataFrame, lookback: int = 100,
-                 impulse_pct: float = 1.5) -> list[OrderBlock]:
+def order_block(df: pd.DataFrame,
+                impulse_pct: float = 1.2,
+                proximity_pct: float = 2.0) -> Optional[OrderBlockResult]:
     """
-    Detect bullish and bearish order blocks within `lookback` bars.
-
-    Bullish OB: last bearish candle before a strong up-move (impulse_pct% or more).
-    Bearish OB: last bullish candle before a strong down-move.
-
-    Only un-mitigated (untested) OBs are most relevant — we flag both
-    but mitigated ones carry lower weight in market_analyzer.
+    A bullish OB is the last bearish candle before a strong bullish impulse.
+    A bearish OB is the last bullish candle before a strong bearish impulse.
     """
     if len(df) < 10:
-        return []
-
-    df_slice = df.iloc[-lookback:].reset_index(drop=True)
-    current  = float(df['close'].iloc[-1])
-    obs      = []
-
-    for i in range(1, len(df_slice) - 1):
-        candle_open  = float(df_slice['open'].iloc[i])
-        candle_close = float(df_slice['close'].iloc[i])
-        next_open    = float(df_slice['open'].iloc[i + 1])
-        next_close   = float(df_slice['close'].iloc[i + 1])
-
-        # Measure impulse of the NEXT candle
-        next_move_pct = abs(next_close - next_open) / next_open * 100 if next_open != 0 else 0
-
-        if next_move_pct < impulse_pct:
-            continue  # not an impulsive move — skip
-
-        # Bullish OB: current candle is bearish, next candle is strongly bullish
-        if candle_close < candle_open and next_close > next_open:
-            top    = max(candle_open, candle_close)
-            bottom = min(candle_open, candle_close)
-            mid    = (top + bottom) / 2
-            # Mitigated if price has since traded back into the OB
-            subsequent_lows = df_slice['low'].iloc[i + 1:].min() if i + 1 < len(df_slice) else current
-            mitigated = float(subsequent_lows) <= top
-
-            obs.append(OrderBlock(
-                ob_type='bullish',
-                top=top, bottom=bottom, mid=mid,
-                index=i,
-                distance_pct=abs(current - mid) / current * 100,
-                mitigated=mitigated,
-            ))
-
-        # Bearish OB: current candle is bullish, next candle is strongly bearish
-        elif candle_close > candle_open and next_close < next_open:
-            top    = max(candle_open, candle_close)
-            bottom = min(candle_open, candle_close)
-            mid    = (top + bottom) / 2
-            subsequent_highs = df_slice['high'].iloc[i + 1:].max() if i + 1 < len(df_slice) else current
-            mitigated = float(subsequent_highs) >= bottom
-
-            obs.append(OrderBlock(
-                ob_type='bearish',
-                top=top, bottom=bottom, mid=mid,
-                index=i,
-                distance_pct=abs(current - mid) / current * 100,
-                mitigated=mitigated,
-            ))
-
-    # Sort by recency (highest index = most recent) and proximity
-    obs.sort(key=lambda x: (-x.index, x.distance_pct))
-
-    # Return the 3 most relevant of each type
-    bullish = [o for o in obs if o.ob_type == 'bullish'][:3]
-    bearish = [o for o in obs if o.ob_type == 'bearish'][:3]
-    return bullish + bearish
-
-
-# ──────────────────────────────────────────────────────────────
-# 2. FAIR VALUE GAPS (FVG / Imbalances)
-# A 3-candle sequence where candle 1 high and candle 3 low don't
-# overlap leaves a gap price is magnetically drawn to fill.
-# ──────────────────────────────────────────────────────────────
-
-@dataclass
-class FairValueGap:
-    fvg_type: str     # 'bullish' | 'bearish'
-    top: float        # upper boundary of the gap
-    bottom: float     # lower boundary
-    mid: float
-    distance_pct: float
-    filled: bool      # True if price has already closed into the gap
-
-
-def fair_value_gaps(df: pd.DataFrame, lookback: int = 50) -> list[FairValueGap]:
-    """
-    Bullish FVG: candle[i-1].high < candle[i+1].low — gap left above candle i-1.
-    Bearish FVG: candle[i-1].low  > candle[i+1].high — gap left below candle i-1.
-    """
-    if len(df) < 5:
-        return []
-
-    df_slice = df.iloc[-lookback:].reset_index(drop=True)
-    current  = float(df['close'].iloc[-1])
-    fvgs     = []
-
-    for i in range(1, len(df_slice) - 1):
-        h_prev = float(df_slice['high'].iloc[i - 1])
-        l_prev = float(df_slice['low'].iloc[i - 1])
-        h_next = float(df_slice['high'].iloc[i + 1])
-        l_next = float(df_slice['low'].iloc[i + 1])
-
-        # Bullish FVG: gap is above the previous candle (price moved up fast)
-        if h_prev < l_next:
-            top    = l_next
-            bottom = h_prev
-            mid    = (top + bottom) / 2
-            # Filled if current price has traded back into the gap
-            filled = current <= top and current >= bottom
-            fvgs.append(FairValueGap(
-                fvg_type='bullish',
-                top=top, bottom=bottom, mid=mid,
-                distance_pct=abs(current - mid) / current * 100,
-                filled=filled,
-            ))
-
-        # Bearish FVG: gap is below the previous candle (price moved down fast)
-        elif l_prev > h_next:
-            top    = l_prev
-            bottom = h_next
-            mid    = (top + bottom) / 2
-            filled = current >= bottom and current <= top
-            fvgs.append(FairValueGap(
-                fvg_type='bearish',
-                top=top, bottom=bottom, mid=mid,
-                distance_pct=abs(current - mid) / current * 100,
-                filled=filled,
-            ))
-
-    # Most recent and closest unfilled gaps are most relevant
-    fvgs.sort(key=lambda x: (x.filled, x.distance_pct))
-    bullish = [f for f in fvgs if f.fvg_type == 'bullish' and not f.filled][:2]
-    bearish = [f for f in fvgs if f.fvg_type == 'bearish' and not f.filled][:2]
-    return bullish + bearish
-
-
-# ──────────────────────────────────────────────────────────────
-# 3. BREAK OF STRUCTURE (BOS) / CHANGE OF CHARACTER (CHoCH)
-# BOS  = price breaks beyond the last swing in the same direction → trend continuation
-# CHoCH = price breaks against the prevailing structure → potential reversal
-# ──────────────────────────────────────────────────────────────
-
-@dataclass
-class StructureBreak:
-    event: str          # 'bos_bullish' | 'bos_bearish' | 'choch_bullish' | 'choch_bearish'
-    broken_level: float # the swing high/low that was broken
-    strength: float     # % of the break beyond the level
-    bars_ago: int       # how many bars since the event
-
-
-def break_of_structure(df: pd.DataFrame, swing_lookback: int = 20) -> Optional[StructureBreak]:
-    """
-    Identify the most recent BOS or CHoCH event within the last `swing_lookback` bars.
-    Returns the single most recent event or None.
-
-    Logic:
-    - Find the last significant swing high and swing low
-    - If current close > last swing high → BOS bullish (continuation if uptrend, CHoCH if downtrend)
-    - If current close < last swing low  → BOS bearish (continuation if downtrend, CHoCH if uptrend)
-    """
-    if len(df) < swing_lookback + 5:
         return None
 
-    window  = df.iloc[-swing_lookback - 5:]
     current = float(df['close'].iloc[-1])
-    wsize   = 3  # pivot window
+    bull_level = 0.0
+    bear_level = 0.0
+    bull_ob    = False
+    bear_ob    = False
 
-    # Find most recent swing high and swing low in the lookback window
+    for i in range(2, min(len(df) - 1, 30)):
+        idx = -(i + 1)  # look-back bar
+        nxt = -i        # next bar (the impulse bar)
+
+        o_curr = float(df['open'].iloc[idx])
+        c_curr = float(df['close'].iloc[idx])
+        o_nxt  = float(df['open'].iloc[nxt])
+        c_nxt  = float(df['close'].iloc[nxt])
+
+        if o_curr == 0 or o_nxt == 0:
+            continue
+
+        move_pct = abs(c_nxt - o_nxt) / o_nxt * 100
+
+        # Bullish OB: bearish candle followed by a strong bullish impulse
+        if c_curr < o_curr and c_nxt > o_nxt and move_pct >= impulse_pct:
+            bull_level = float(df['close'].iloc[idx])
+            bull_ob    = True
+            break
+
+    for i in range(2, min(len(df) - 1, 30)):
+        idx = -(i + 1)
+        nxt = -i
+
+        o_curr = float(df['open'].iloc[idx])
+        c_curr = float(df['close'].iloc[idx])
+        o_nxt  = float(df['open'].iloc[nxt])
+        c_nxt  = float(df['close'].iloc[nxt])
+
+        if o_curr == 0 or o_nxt == 0:
+            continue
+
+        move_pct = abs(c_nxt - o_nxt) / o_nxt * 100
+
+        # Bearish OB: bullish candle followed by a strong bearish impulse
+        if c_curr > o_curr and c_nxt < o_nxt and move_pct >= impulse_pct:
+            bear_level = float(df['close'].iloc[idx])
+            bear_ob    = True
+            break
+
+    near_bull = bull_ob and abs(current - bull_level) / bull_level * 100 <= proximity_pct \
+                if bull_level != 0 else False
+    near_bear = bear_ob and abs(current - bear_level) / bear_level * 100 <= proximity_pct \
+                if bear_level != 0 else False
+
+    return OrderBlockResult(
+        bullish_ob=bull_ob,
+        bearish_ob=bear_ob,
+        bullish_level=bull_level,
+        bearish_level=bear_level,
+        near_bullish=near_bull,
+        near_bearish=near_bear,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# SMC — FAIR VALUE GAP
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class FVGResult:
+    bullish_fvg:      bool
+    bearish_fvg:      bool
+    bull_high:        float
+    bull_low:         float
+    bear_high:        float
+    bear_low:         float
+    price_in_bullish: bool
+    price_in_bearish: bool
+
+
+def fair_value_gap(df: pd.DataFrame, proximity_pct: float = 1.5) -> Optional[FVGResult]:
+    """
+    FVG = three-candle pattern where candle 1's wick and candle 3's wick
+    don't overlap, leaving an imbalance gap.
+
+    Bullish FVG: candle 3 low > candle 1 high  (gap to the upside)
+    Bearish FVG: candle 3 high < candle 1 low  (gap to the downside)
+    """
+    if len(df) < 5:
+        return None
+
+    current     = float(df['close'].iloc[-1])
+    bull_fvg    = False
+    bear_fvg    = False
+    bull_hi     = 0.0
+    bull_lo     = 0.0
+    bear_hi     = 0.0
+    bear_lo     = 0.0
+
+    for i in range(2, min(len(df) - 2, 30)):
+        c1_hi = float(df['high'].iloc[-(i + 2)])
+        c1_lo = float(df['low'].iloc[-(i + 2)])
+        c3_hi = float(df['high'].iloc[-i])
+        c3_lo = float(df['low'].iloc[-i])
+
+        # Bullish FVG
+        if c3_lo > c1_hi:
+            bull_lo = c1_hi
+            bull_hi = c3_lo
+            bull_fvg = True
+            break
+
+    for i in range(2, min(len(df) - 2, 30)):
+        c1_hi = float(df['high'].iloc[-(i + 2)])
+        c1_lo = float(df['low'].iloc[-(i + 2)])
+        c3_hi = float(df['high'].iloc[-i])
+        c3_lo = float(df['low'].iloc[-i])
+
+        # Bearish FVG
+        if c3_hi < c1_lo:
+            bear_hi = c1_lo
+            bear_lo = c3_hi
+            bear_fvg = True
+            break
+
+    in_bull = bull_fvg and bull_lo <= current <= bull_hi
+    in_bear = bear_fvg and bear_lo <= current <= bear_hi
+
+    return FVGResult(
+        bullish_fvg=bull_fvg,
+        bearish_fvg=bear_fvg,
+        bull_high=bull_hi,
+        bull_low=bull_lo,
+        bear_high=bear_hi,
+        bear_low=bear_lo,
+        price_in_bullish=in_bull,
+        price_in_bearish=in_bear,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# SMC — BOS / CHoCH
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class BOSCHoCHResult:
+    bullish_bos:   bool   # Break of Structure upward
+    bearish_bos:   bool   # Break of Structure downward
+    bullish_choch: bool   # Change of Character (reversal) upward
+    bearish_choch: bool   # Change of Character (reversal) downward
+
+
+def bos_choch(df: pd.DataFrame, max_bars: int = 3) -> Optional[BOSCHoCHResult]:
+    """
+    BOS  : price breaks the most recent swing high/low in the SAME direction as trend.
+    CHoCH: price breaks in the OPPOSITE direction — potential trend reversal.
+
+    We use a simplified 3-bar swing high/low for speed.
+    """
+    if len(df) < 10:
+        return None
+
+    # Find last swing high and low (3-bar pivot) in the last 20 bars
+    window = df.iloc[-20:].reset_index(drop=True)
+    n = len(window)
+    current = float(df['close'].iloc[-1])
+
     swing_highs = []
     swing_lows  = []
 
+    for i in range(1, n - 1):
+        h = float(window['high'].iloc[i])
+        l = float(window['low'].iloc[i])
+        if h > float(window['high'].iloc[i - 1]) and h > float(window['high'].iloc[i + 1]):
+            swing_highs.append(h)
+        if l < float(window['low'].iloc[i - 1]) and l < float(window['low'].iloc[i + 1]):
+            swing_lows.append(l)
+
+    bull_bos = bear_bos = bull_choch = bear_choch = False
+
+    # Determine recent trend from last N closes
+    recent_closes = df['close'].iloc[-6:]
+    rising = float(recent_closes.iloc[-1]) > float(recent_closes.iloc[0])
+
+    if swing_highs:
+        last_high = swing_highs[-1]
+        if current > last_high * 1.001:           # broke above swing high
+            if rising:
+                bull_bos   = True                 # BOS — same direction as trend
+            else:
+                bull_choch = True                 # CHoCH — reversal upward
+
+    if swing_lows:
+        last_low = swing_lows[-1]
+        if current < last_low * 0.999:            # broke below swing low
+            if not rising:
+                bear_bos   = True                 # BOS — same direction
+            else:
+                bear_choch = True                 # CHoCH — reversal downward
+
+    return BOSCHoCHResult(
+        bullish_bos=bull_bos,
+        bearish_bos=bear_bos,
+        bullish_choch=bull_choch,
+        bearish_choch=bear_choch,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# SMC — LIQUIDITY SWEEP
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class LiquiditySweepResult:
+    bull_sweep:   bool    # swept a low then reversed up
+    bear_sweep:   bool    # swept a high then reversed down
+    swept_level:  float
+
+
+def liquidity_sweep(df: pd.DataFrame, max_bars: int = 2) -> Optional[LiquiditySweepResult]:
+    """
+    A liquidity sweep (stop hunt) occurs when price briefly breaks a key
+    swing high/low (triggering stops) then reverses sharply.
+
+    Bullish sweep: wick below a swing low but closed above it → long setup.
+    Bearish sweep: wick above a swing high but closed below it → short setup.
+    """
+    if len(df) < 10:
+        return None
+
+    window = df.iloc[-20:].reset_index(drop=True)
+    n = len(window)
+
+    swing_highs = []
+    swing_lows  = []
+
+    for i in range(1, n - max_bars - 1):
+        h = float(window['high'].iloc[i])
+        l = float(window['low'].iloc[i])
+        if h > float(window['high'].iloc[i - 1]) and h > float(window['high'].iloc[i + 1]):
+            swing_highs.append((i, h))
+        if l < float(window['low'].iloc[i - 1]) and l < float(window['low'].iloc[i + 1]):
+            swing_lows.append((i, l))
+
+    bull_sweep  = False
+    bear_sweep  = False
+    swept_level = 0.0
+
+    # Check last max_bars candles for sweeps
+    for offset in range(1, max_bars + 1):
+        bar_low   = float(df['low'].iloc[-offset])
+        bar_high  = float(df['high'].iloc[-offset])
+        bar_close = float(df['close'].iloc[-offset])
+
+        if swing_lows:
+            level = swing_lows[-1][1]
+            # Wick below swing low but closed above it
+            if bar_low < level * 0.999 and bar_close > level:
+                bull_sweep  = True
+                swept_level = level
+                break
+
+        if swing_highs:
+            level = swing_highs[-1][1]
+            # Wick above swing high but closed below it
+            if bar_high > level * 1.001 and bar_close < level:
+                bear_sweep  = True
+                swept_level = level
+                break
+
+    return LiquiditySweepResult(
+        bull_sweep=bull_sweep,
+        bear_sweep=bear_sweep,
+        swept_level=swept_level,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# BRIAN SHANNON — ANCHORED VWAP
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class AVWAPResult:
+    anchor_bar:  int
+    value:       float
+    slope_pct:   float
+    price_above: bool
+
+
+def anchored_vwap(df: pd.DataFrame, anchor_bar: int) -> Optional[AVWAPResult]:
+    if anchor_bar < 0:
+        anchor_bar = max(0, len(df) + anchor_bar)
+    if anchor_bar >= len(df) - 1:
+        return None
+
+    segment = df.iloc[anchor_bar:].copy()
+    if len(segment) < 2:
+        return None
+
+    typical_price = (segment['high'] + segment['low'] + segment['close']) / 3
+    tp_vol  = typical_price * segment['volume']
+    cumvol  = segment['volume'].cumsum()
+    if float(cumvol.iloc[-1]) == 0:
+        return None
+
+    avwap_series = tp_vol.cumsum() / cumvol
+    value   = float(avwap_series.iloc[-1])
+    current = float(df['close'].iloc[-1])
+
+    if len(avwap_series) >= 5:
+        prev_val  = float(avwap_series.iloc[-5])
+        slope_pct = (value - prev_val) / prev_val * 100 if prev_val != 0 else 0.0
+    else:
+        slope_pct = 0.0
+
+    return AVWAPResult(
+        anchor_bar=anchor_bar,
+        value=value,
+        slope_pct=slope_pct,
+        price_above=current > value,
+    )
+
+
+@dataclass
+class AVWAPPinchResult:
+    pinch_active: bool
+    high_avwap:   float
+    low_avwap:    float
+    width_pct:    float
+    breakout:     str    # 'bullish' | 'bearish' | 'none'
+    slope_filter: bool
+
+
+def avwap_pinch(df: pd.DataFrame, lookback: int = 60) -> Optional[AVWAPPinchResult]:
+    if len(df) < lookback + 10:
+        return None
+
+    window  = df.iloc[-lookback:]
+    current = float(df['close'].iloc[-1])
+
+    swing_high_idx = None
+    swing_low_idx  = None
+    wsize = 3
+
     for i in range(wsize, len(window) - wsize):
+        h = float(window['high'].iloc[i])
+        l = float(window['low'].iloc[i])
+
+        if all(h >= float(window['high'].iloc[i - j]) for j in range(1, wsize + 1)) and \
+           all(h >= float(window['high'].iloc[i + j]) for j in range(1, wsize + 1)):
+            swing_high_idx = len(df) - lookback + i
+
+        if all(l <= float(window['low'].iloc[i - j]) for j in range(1, wsize + 1)) and \
+           all(l <= float(window['low'].iloc[i + j]) for j in range(1, wsize + 1)):
+            swing_low_idx = len(df) - lookback + i
+
+    if swing_high_idx is None or swing_low_idx is None:
+        return None
+
+    avwap_from_high = anchored_vwap(df, swing_high_idx)
+    avwap_from_low  = anchored_vwap(df, swing_low_idx)
+
+    if avwap_from_high is None or avwap_from_low is None:
+        return None
+
+    top_avwap = max(avwap_from_high.value, avwap_from_low.value)
+    bot_avwap = min(avwap_from_high.value, avwap_from_low.value)
+
+    width_pct    = (top_avwap - bot_avwap) / current * 100 if current != 0 else 0.0
+    between      = bot_avwap <= current <= top_avwap
+    pinch_active = between and width_pct < 3.0
+
+    if current > top_avwap * 1.002:
+        breakout = 'bullish'
+    elif current < bot_avwap * 0.998:
+        breakout = 'bearish'
+    else:
+        breakout = 'none'
+
+    slope_filter = avwap_from_low.slope_pct > 0
+
+    return AVWAPPinchResult(
+        pinch_active=pinch_active,
+        high_avwap=top_avwap,
+        low_avwap=bot_avwap,
+        width_pct=width_pct,
+        breakout=breakout,
+        slope_filter=slope_filter,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# BILL WILLIAMS — THE ALLIGATOR
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class AlligatorResult:
+    jaw:              float
+    teeth:            float
+    lips:             float
+    phase:            str    # 'sleeping'|'awakening'|'eating_bull'|'eating_bear'|'sated'
+    lips_above_jaw:   bool
+    lips_above_teeth: bool
+
+
+def _smma(series: pd.Series, period: int) -> pd.Series:
+    result = series.copy().astype(float)
+    result.iloc[:period] = np.nan
+    seed = float(series.iloc[:period].mean())
+    result.iloc[period - 1] = seed
+    for i in range(period, len(series)):
+        result.iloc[i] = (result.iloc[i - 1] * (period - 1) + series.iloc[i]) / period
+    return result
+
+
+def alligator(df: pd.DataFrame) -> Optional[AlligatorResult]:
+    if len(df) < 30:
+        return None
+
+    median    = (df['high'] + df['low']) / 2
+    jaw_raw   = _smma(median, 13)
+    teeth_raw = _smma(median, 8)
+    lips_raw  = _smma(median, 5)
+
+    if len(jaw_raw.dropna()) < 9:
+        return None
+
+    jaw_val   = float(jaw_raw.iloc[-8])   if len(jaw_raw)   >= 8 else float(jaw_raw.iloc[-1])
+    teeth_val = float(teeth_raw.iloc[-5]) if len(teeth_raw) >= 5 else float(teeth_raw.iloc[-1])
+    lips_val  = float(lips_raw.iloc[-3])  if len(lips_raw)  >= 3 else float(lips_raw.iloc[-1])
+
+    vals       = sorted([jaw_val, teeth_val, lips_val])
+    spread_pct = (vals[2] - vals[0]) / vals[1] * 100 if vals[1] != 0 else 0
+
+    lips_above_jaw   = lips_val > jaw_val
+    lips_above_teeth = lips_val > teeth_val
+    in_order_bull    = lips_val > teeth_val > jaw_val
+    in_order_bear    = lips_val < teeth_val < jaw_val
+
+    if spread_pct < 0.3:
+        phase = 'sleeping'
+    elif in_order_bull and spread_pct > 0.6:
+        if len(lips_raw) >= 4:
+            prev_lips = float(lips_raw.iloc[-4])
+            phase = 'eating_bull' if lips_val > prev_lips else 'sated'
+        else:
+            phase = 'eating_bull'
+    elif in_order_bear and spread_pct > 0.6:
+        if len(lips_raw) >= 4:
+            prev_lips = float(lips_raw.iloc[-4])
+            phase = 'eating_bear' if lips_val < prev_lips else 'sated'
+        else:
+            phase = 'eating_bear'
+    elif spread_pct < 0.6:
+        phase = 'awakening'
+    else:
+        phase = 'sated'
+
+    return AlligatorResult(
+        jaw=jaw_val,
+        teeth=teeth_val,
+        lips=lips_val,
+        phase=phase,
+        lips_above_jaw=lips_above_jaw,
+        lips_above_teeth=lips_above_teeth,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# BILL WILLIAMS — AWESOME OSCILLATOR (AO)
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class AOResult:
+    value:      float
+    prev_value: float
+    signal:     str          # 'bullish_cross'|'bearish_cross'|'bullish'|'bearish'|'neutral'
+    twin_peaks: Optional[str]  # 'bullish_twin'|'bearish_twin'|None
+
+
+def awesome_oscillator(df: pd.DataFrame, fast: int = 5, slow: int = 34) -> Optional[AOResult]:
+    if len(df) < slow + 5:
+        return None
+
+    midprice = (df['high'] + df['low']) / 2
+    ao = midprice.rolling(fast).mean() - midprice.rolling(slow).mean()
+
+    curr  = float(ao.iloc[-1])
+    prev  = float(ao.iloc[-2])
+
+    if prev <= 0 and curr > 0:
+        signal = 'bullish_cross'
+    elif prev >= 0 and curr < 0:
+        signal = 'bearish_cross'
+    elif curr > 0 and curr > prev:
+        signal = 'bullish'
+    elif curr < 0 and curr < prev:
+        signal = 'bearish'
+    else:
+        signal = 'neutral'
+
+    twin_peaks = None
+    if len(ao) >= 6:
+        w = ao.iloc[-6:].values
+        lows_below = [(i, v) for i, v in enumerate(w) if v < 0]
+        if len(lows_below) >= 2:
+            i1, v1 = lows_below[-2]
+            i2, v2 = lows_below[-1]
+            if v2 > v1 and i2 > i1:
+                twin_peaks = 'bullish_twin'
+        highs_above = [(i, v) for i, v in enumerate(w) if v > 0]
+        if len(highs_above) >= 2:
+            i1, v1 = highs_above[-2]
+            i2, v2 = highs_above[-1]
+            if v2 < v1 and i2 > i1:
+                twin_peaks = 'bearish_twin'
+
+    return AOResult(value=curr, prev_value=prev, signal=signal, twin_peaks=twin_peaks)
+
+
+# ══════════════════════════════════════════════════════════════
+# BILL WILLIAMS — FRACTALS
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class FractalResult:
+    last_up_fractal:   Optional[float]
+    last_down_fractal: Optional[float]
+    bars_since_up:     int
+    bars_since_down:   int
+    breakout_above_up: bool
+    breakout_below_dn: bool
+
+
+def fractals(df: pd.DataFrame, lookback: int = 60) -> Optional[FractalResult]:
+    if len(df) < 10:
+        return None
+
+    window  = df.iloc[-lookback:].reset_index(drop=True)
+    n       = len(window)
+    current = float(df['close'].iloc[-1])
+
+    last_up_fractal   = None
+    last_up_idx       = None
+    last_down_fractal = None
+    last_down_idx     = None
+
+    for i in range(2, n - 2):
+        h = float(window['high'].iloc[i])
+        l = float(window['low'].iloc[i])
+
+        if (h > float(window['high'].iloc[i - 1]) and
+            h > float(window['high'].iloc[i - 2]) and
+            h > float(window['high'].iloc[i + 1]) and
+            h > float(window['high'].iloc[i + 2])):
+            last_up_fractal = h
+            last_up_idx     = i
+
+        if (l < float(window['low'].iloc[i - 1]) and
+            l < float(window['low'].iloc[i - 2]) and
+            l < float(window['low'].iloc[i + 1]) and
+            l < float(window['low'].iloc[i + 2])):
+            last_down_fractal = l
+            last_down_idx     = i
+
+    bars_since_up   = (n - 1 - last_up_idx)   if last_up_idx   is not None else 999
+    bars_since_down = (n - 1 - last_down_idx)  if last_down_idx is not None else 999
+
+    breakout_above_up = last_up_fractal is not None and current > last_up_fractal * 1.001
+    breakout_below_dn = last_down_fractal is not None and current < last_down_fractal * 0.999
+
+    return FractalResult(
+        last_up_fractal=last_up_fractal,
+        last_down_fractal=last_down_fractal,
+        bars_since_up=bars_since_up,
+        bars_since_down=bars_since_down,
+        breakout_above_up=breakout_above_up,
+        breakout_below_dn=breakout_below_dn,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# MIKE BELLAFIORE — RELATIVE VOLUME FILTER
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class RelativeVolumeResult:
+    rvol:        float
+    is_in_play:  bool
+    average_vol: float
+    current_vol: float
+
+
+def volume_relative(df: pd.DataFrame,
+                    lookback: int = 20,
+                    threshold: float = 1.5) -> Optional[RelativeVolumeResult]:
+    if 'volume' not in df.columns or len(df) < lookback + 1:
+        return None
+
+    vol     = df['volume']
+    avg     = float(vol.iloc[-(lookback + 1):-1].mean())
+    current = float(vol.iloc[-1])
+
+    if avg == 0:
+        return None
+
+    rvol = current / avg
+    return RelativeVolumeResult(
+        rvol=rvol,
+        is_in_play=rvol >= threshold,
+        average_vol=avg,
+        current_vol=current,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# JACK SCHWAGER — BREAKOUT TRAP DETECTOR
+# ══════════════════════════════════════════════════════════════
+
+@dataclass
+class TrapResult:
+    trap_type:    Optional[str]   # 'bull_trap' | 'bear_trap' | None
+    trap_level:   float
+    reversal_pct: float
+    bars_ago:     int
+    signal:       str             # 'sell' | 'buy' | 'none'
+
+
+def trap_detector(df: pd.DataFrame,
+                  lookback: int = 30,
+                  min_breakout_pct: float = 0.3,
+                  max_trap_bars: int = 5) -> Optional[TrapResult]:
+    if len(df) < lookback + 5:
+        return None
+
+    window = df.iloc[-lookback:].reset_index(drop=True)
+    n      = len(window)
+    current_close = float(df['close'].iloc[-1])
+
+    swing_highs = []
+    swing_lows  = []
+    wsize = 3
+
+    for i in range(wsize, n - wsize):
         h = float(window['high'].iloc[i])
         l = float(window['low'].iloc[i])
 
@@ -645,124 +843,128 @@ def break_of_structure(df: pd.DataFrame, swing_lookback: int = 20) -> Optional[S
            all(l <= float(window['low'].iloc[i + j]) for j in range(1, wsize + 1)):
             swing_lows.append((i, l))
 
-    if not swing_highs and not swing_lows:
-        return None
+    for offset in range(1, max_trap_bars + 1):
+        idx = -(1 + offset)
+        if abs(idx) > len(df):
+            break
 
-    # Get most recent swing high and low
-    last_sh = swing_highs[-1] if swing_highs else None
-    last_sl = swing_lows[-1]  if swing_lows  else None
+        c_high  = float(df['high'].iloc[idx])
+        c_low   = float(df['low'].iloc[idx])
+        c_close = float(df['close'].iloc[idx])
 
-    # Determine prior trend from swing sequence
-    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-        sh_rising = swing_highs[-1][1] > swing_highs[-2][1]
-        sl_rising = swing_lows[-1][1]  > swing_lows[-2][1]
-        prior_uptrend   = sh_rising and sl_rising
-        prior_downtrend = not sh_rising and not sl_rising
-    else:
-        prior_uptrend   = False
-        prior_downtrend = False
+        if swing_highs:
+            level = swing_highs[-1][1]
+            if c_high > level * (1 + min_breakout_pct / 100) and c_close < level:
+                reversal_pct = (c_high - current_close) / c_high * 100
+                return TrapResult(
+                    trap_type='bull_trap',
+                    trap_level=level,
+                    reversal_pct=reversal_pct,
+                    bars_ago=offset,
+                    signal='sell',
+                )
 
-    total_bars = len(df)
+        if swing_lows:
+            level = swing_lows[-1][1]
+            if c_low < level * (1 - min_breakout_pct / 100) and c_close > level:
+                reversal_pct = (current_close - c_low) / c_low * 100
+                return TrapResult(
+                    trap_type='bear_trap',
+                    trap_level=level,
+                    reversal_pct=reversal_pct,
+                    bars_ago=offset,
+                    signal='buy',
+                )
 
-    # Check if current candle broke a swing
-    if last_sh and current > last_sh[1]:
-        strength  = (current - last_sh[1]) / last_sh[1] * 100
-        bars_ago  = total_bars - (total_bars - swing_lookback - 5 + last_sh[0])
-        event     = 'bos_bullish' if prior_uptrend else 'choch_bullish'
-        return StructureBreak(event=event, broken_level=last_sh[1],
-                              strength=strength, bars_ago=max(0, bars_ago))
-
-    if last_sl and current < last_sl[1]:
-        strength  = (last_sl[1] - current) / last_sl[1] * 100
-        bars_ago  = total_bars - (total_bars - swing_lookback - 5 + last_sl[0])
-        event     = 'bos_bearish' if prior_downtrend else 'choch_bearish'
-        return StructureBreak(event=event, broken_level=last_sl[1],
-                              strength=strength, bars_ago=max(0, bars_ago))
-
-    return None
+    return TrapResult(trap_type=None, trap_level=0.0, reversal_pct=0.0, bars_ago=0, signal='none')
 
 
-# ──────────────────────────────────────────────────────────────
-# 4. LIQUIDITY SWEEPS (stop-hunt detection)
-# Institutions push price through a cluster of retail stop-losses
-# (below a swing low / above a swing high) then reverse sharply.
-# A sweep + immediate reversal = high-quality entry signal.
-# ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# ELLIOTT WAVE — DIVERGENCE DETECTOR
+# ══════════════════════════════════════════════════════════════
 
 @dataclass
-class LiquiditySweep:
-    sweep_type: str     # 'bullish_sweep' (swept lows, reversal up) | 'bearish_sweep' (swept highs, reversal down)
-    swept_level: float  # the swing level that was swept
-    wick_pct: float     # size of the sweep wick as % of price
-    bars_ago: int       # 0 = current candle, 1 = previous candle
+class ElliottDivergenceResult:
+    wave_context:   str    # 'wave3_likely'|'wave5_warning'|'wave_a_likely'|'none'
+    rsi_divergence: bool
+    price_high:     float
+    rsi_at_high:    float
 
 
-def liquidity_sweep(df: pd.DataFrame, lookback: int = 30) -> Optional[LiquiditySweep]:
-    """
-    Detect a liquidity sweep: price wicks through a swing level but closes back on the other side.
-
-    Bullish sweep: low of a candle breaks below a prior swing low,
-                   but close recovers ABOVE that swing low → stop-hunt, reversal likely up.
-
-    Bearish sweep: high of a candle breaks above a prior swing high,
-                   but close falls BACK below that swing high → stop-hunt, reversal likely down.
-
-    Check the last 3 candles for a recent sweep.
-    """
-    if len(df) < lookback + 5:
+def elliott_divergence(df: pd.DataFrame,
+                       rsi_period: int = 14,
+                       lookback: int = 50) -> Optional[ElliottDivergenceResult]:
+    if len(df) < lookback + rsi_period + 5:
         return None
 
-    # Get recent swing levels using a smaller window
-    recent_df     = df.iloc[-lookback:]
-    current_price = float(df['close'].iloc[-1])
-    swing_window  = 5
+    close    = df['close']
+    delta    = close.diff()
+    gain     = delta.clip(lower=0)
+    loss     = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(com=rsi_period - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=rsi_period - 1, adjust=False).mean()
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
+    rsi_series = 100 - 100 / (1 + rs)
 
-    recent_highs = []
-    recent_lows  = []
+    window_price = df['high'].iloc[-lookback:].reset_index(drop=True)
+    window_rsi   = rsi_series.iloc[-lookback:].reset_index(drop=True)
+    n     = len(window_price)
+    wsize = 4
 
-    for i in range(swing_window, len(recent_df) - swing_window):
-        h = float(recent_df['high'].iloc[i])
-        l = float(recent_df['low'].iloc[i])
-        if all(h >= float(recent_df['high'].iloc[i - j]) for j in range(1, swing_window + 1)) and \
-           all(h >= float(recent_df['high'].iloc[i + j]) for j in range(1, swing_window + 1)):
-            recent_highs.append(h)
-        if all(l <= float(recent_df['low'].iloc[i - j]) for j in range(1, swing_window + 1)) and \
-           all(l <= float(recent_df['low'].iloc[i + j]) for j in range(1, swing_window + 1)):
-            recent_lows.append(l)
+    price_highs = []
+    for i in range(wsize, n - wsize):
+        h = float(window_price.iloc[i])
+        if all(h >= float(window_price.iloc[i - j]) for j in range(1, wsize + 1)) and \
+           all(h >= float(window_price.iloc[i + j]) for j in range(1, wsize + 1)):
+            price_highs.append((i, h, float(window_rsi.iloc[i])))
 
-    if not recent_highs and not recent_lows:
-        return None
+    if len(price_highs) < 2:
+        # Try lows for Wave A
+        price_lows = []
+        window_low = df['low'].iloc[-lookback:].reset_index(drop=True)
+        for i in range(wsize, n - wsize):
+            l = float(window_low.iloc[i])
+            if all(l <= float(window_low.iloc[i - j]) for j in range(1, wsize + 1)) and \
+               all(l <= float(window_low.iloc[i + j]) for j in range(1, wsize + 1)):
+                price_lows.append((i, l, float(window_rsi.iloc[i])))
 
-    # Check last 3 candles for a sweep
-    for offset in range(min(3, len(df))):
-        idx   = -(1 + offset)
-        c_low   = float(df['low'].iloc[idx])
-        c_high  = float(df['high'].iloc[idx])
-        c_close = float(df['close'].iloc[idx])
-        c_open  = float(df['open'].iloc[idx])
-
-        # Bullish sweep: wick broke below a swing low but candle closed above it
-        if recent_lows:
-            nearest_low = min(recent_lows, key=lambda x: abs(x - c_low))
-            if c_low < nearest_low and c_close > nearest_low:
-                wick_pct = (nearest_low - c_low) / nearest_low * 100
-                return LiquiditySweep(
-                    sweep_type='bullish_sweep',
-                    swept_level=nearest_low,
-                    wick_pct=wick_pct,
-                    bars_ago=offset,
+        if len(price_lows) >= 2:
+            _, prev_l, prev_rsi = price_lows[-2]
+            _, last_l, last_rsi = price_lows[-1]
+            if last_l < prev_l and last_rsi > prev_rsi:
+                return ElliottDivergenceResult(
+                    wave_context='wave_a_likely',
+                    rsi_divergence=True,
+                    price_high=last_l,
+                    rsi_at_high=last_rsi,
                 )
 
-        # Bearish sweep: wick broke above a swing high but candle closed below it
-        if recent_highs:
-            nearest_high = min(recent_highs, key=lambda x: abs(x - c_high))
-            if c_high > nearest_high and c_close < nearest_high:
-                wick_pct = (c_high - nearest_high) / nearest_high * 100
-                return LiquiditySweep(
-                    sweep_type='bearish_sweep',
-                    swept_level=nearest_high,
-                    wick_pct=wick_pct,
-                    bars_ago=offset,
-                )
+        return ElliottDivergenceResult(
+            wave_context='none',
+            rsi_divergence=False,
+            price_high=float(df['high'].iloc[-1]),
+            rsi_at_high=float(rsi_series.iloc[-1]),
+        )
 
-    return None
+    prev_swing = price_highs[-2]
+    last_swing = price_highs[-1]
+
+    price_new_high = last_swing[1] > prev_swing[1]
+    rsi_new_high   = last_swing[2] > prev_swing[2]
+
+    if price_new_high and rsi_new_high:
+        wave_context = 'wave3_likely'
+        divergence   = False
+    elif price_new_high and not rsi_new_high:
+        wave_context = 'wave5_warning'
+        divergence   = True
+    else:
+        wave_context = 'none'
+        divergence   = False
+
+    return ElliottDivergenceResult(
+        wave_context=wave_context,
+        rsi_divergence=divergence,
+        price_high=last_swing[1],
+        rsi_at_high=last_swing[2],
+    )

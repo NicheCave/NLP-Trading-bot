@@ -1,11 +1,22 @@
-# executor.py — risk-managed order placement via Alpaca (v2)
+# executor.py — risk-managed order placement via Alpaca (v3)
 # ─────────────────────────────────────────────────────────────
-# Changes from v1:
-#   - _sync_daily_trades_from_api() no longer called every execution cycle.
-#     It is now called on a separate DAILY_SYNC_INTERVAL schedule (60s default)
-#     via sync_daily_counter() which main.py schedules independently.
-#     This reduces API calls from ~3/min to ~1/min with no loss of accuracy.
-#   - All other logic unchanged (3-layer duplicate order guard preserved).
+# Changes from v2 (Bellafiore pyramiding + Elliott Wave caution):
+#
+#   - scale_in_winner(): NEW — adds 50% more size to an already-profitable
+#     position when signal.add_to_winner is True AND unrealized P&L >= 1 ATR.
+#     Implements Bellafiore's "One Good Trade" load-the-boat logic:
+#     enter at 50% on the initial signal, add the other 50% only when the
+#     trade proves itself.
+#
+#   - execute_signal(): now checks signal.wave5_caution and halves
+#     CRYPTO_RISK_PER_TRADE for that trade if the Elliott Wave 5 warning
+#     is active. This reduces position size automatically — no manual override.
+#
+#   - execute_signal(): now checks signal.add_to_winner and calls
+#     scale_in_winner() instead of placing a duplicate full-size buy.
+#
+#   - All other logic preserved from v2 (3-layer duplicate guard, daily
+#     sync on DAILY_SYNC_INTERVAL, crypto stop-loss via check_exits).
 # ─────────────────────────────────────────────────────────────
 import alpaca_trade_api as tradeapi
 from loguru import logger
@@ -15,6 +26,7 @@ from signal_generator import Signal
 from config import is_crypto, to_order_symbol
 from alpaca.data.historical.crypto import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoLatestBarRequest
+import pandas as pd
 
 _pending_buys: set[str] = set()
 
@@ -47,8 +59,7 @@ def _reset_daily_counter_if_needed():
 def sync_daily_counter():
     """
     Sync today's filled order count directly from Alpaca.
-    Call this on a DAILY_SYNC_INTERVAL schedule (main.py), not every
-    execution cycle. Survives restarts and never drifts from reality.
+    Call on DAILY_SYNC_INTERVAL (main.py). Survives restarts.
     """
     global _daily_trades
     _reset_daily_counter_if_needed()
@@ -74,7 +85,6 @@ def get_open_positions() -> list:
 
 
 def already_in_position(ticker: str) -> bool:
-    """Check Alpaca for an open position (handles BTC/USD slash encoding)."""
     try:
         pos          = api.get_position(ticker)
         has_position = float(pos.qty) != 0
@@ -94,10 +104,6 @@ def already_in_position(ticker: str) -> bool:
 
 
 def has_open_or_pending_buy_order(ticker: str) -> bool:
-    """
-    Hard guard against duplicate entries — queries Alpaca directly.
-    Survives process restarts.
-    """
     order_symbol = to_order_symbol(ticker)
     try:
         open_orders = api.list_orders(status='open', limit=100)
@@ -108,23 +114,163 @@ def has_open_or_pending_buy_order(ticker: str) -> bool:
         return False
     except Exception as e:
         logger.warning(f"Could not check open orders for {ticker}: {e} — allowing trade")
-        return False  # fail open rather than freeze trading
+        return False
 
 
 def is_market_open(ticker: str) -> bool:
     if is_crypto(ticker):
-        return True   # crypto never closes
+        return True
     clock = api.get_clock()
     return clock.is_open
 
 
+def _get_current_price(ticker: str, order_symbol: str) -> float | None:
+    """Fetch latest price for a ticker."""
+    if is_crypto(ticker):
+        try:
+            request = CryptoLatestBarRequest(symbol_or_symbols=order_symbol)
+            bar     = _crypto_client.get_crypto_latest_bar(request)
+            return float(bar[order_symbol].close)
+        except Exception as e:
+            logger.warning(f"Price fetch error ({ticker}): {e}")
+            return None
+    else:
+        try:
+            return float(api.get_latest_trade(ticker).price)
+        except Exception as e:
+            logger.warning(f"Price fetch error ({ticker}): {e}")
+            return None
+
+
+def _get_atr_dollars(ticker: str) -> float:
+    """
+    Fetch the 14-bar ATR (in dollars) from the latest hourly bars.
+    Used by scale_in_winner() to confirm >= 1 ATR of profit before pyramiding.
+
+    Delegates to indicators.atr() — the same formula used by market_analyzer —
+    so both modules always agree on volatility. Returns 0.0 on failure so the
+    caller can skip the scale-in gracefully.
+    """
+    try:
+        from market_data import fetch_bars
+        from alpaca.data.timeframe import TimeFrame
+        from indicators import atr as calc_atr
+
+        df = fetch_bars(ticker, TimeFrame.Hour, limit=20)
+        if df.empty or len(df) < 15:
+            return 0.0
+
+        result = calc_atr(df, period=config.ATR_PERIOD)
+        return result.value if result is not None else 0.0
+    except Exception as e:
+        logger.warning(f"ATR fetch failed for {ticker}: {e}")
+        return 0.0
+
+
+def scale_in_winner(ticker: str, signal: Signal):
+    """
+    Bellafiore Pyramiding: add 50% of the original risk to a winning position.
+
+    Called when:
+    - signal.add_to_winner is True (Alligator eating, AO bullish, AVWAP confirmed, RVOL in-play)
+    - The position is already open and showing unrealized gain >= 1 ATR
+
+    This implements "load the boat" — only adding fuel to a fire that's already burning.
+    The scale-in uses 50% of the normal risk allocation to keep total risk controlled.
+    """
+    global _daily_trades
+    _reset_daily_counter_if_needed()
+
+    limit = config.MAX_DAILY_TRADES_CRYPTO if is_crypto(ticker) else config.MAX_DAILY_TRADES_STOCKS
+    if _daily_trades >= limit:
+        logger.info(f"Scale-in skipped for {ticker} — daily limit reached")
+        return
+
+    order_symbol = to_order_symbol(ticker)
+
+    try:
+        pos = api.get_position(ticker)
+    except Exception:
+        logger.debug(f"Scale-in skipped for {ticker} — no open position found")
+        return
+
+    unrealized_pct = float(pos.unrealized_plpc)
+    current_price  = _get_current_price(ticker, order_symbol)
+    if current_price is None:
+        return
+
+    atr_dollars = _get_atr_dollars(ticker)
+
+    # Bellafiore rule: only pyramid if trade is AT LEAST 1 ATR in profit
+    # This prevents adding to a losing position disguised as a winner.
+    if atr_dollars > 0:
+        atr_pct = atr_dollars / current_price
+        if unrealized_pct < atr_pct:
+            logger.info(
+                f"Scale-in NOT triggered for {ticker} — "
+                f"unrealized={unrealized_pct:.1%} < 1 ATR={atr_pct:.1%}. "
+                f"Waiting for position to prove itself."
+            )
+            return
+    elif unrealized_pct < 0.01:
+        # Fallback: require at least 1% profit before adding
+        logger.info(f"Scale-in skipped for {ticker} — position not profitable enough ({unrealized_pct:.1%})")
+        return
+
+    # Position size: 50% of normal risk (don't double the full position)
+    portfolio   = get_portfolio_value()
+    risk        = config.CRYPTO_RISK_PER_TRADE * 0.50   # half-size add-on
+    dollars     = portfolio * risk * signal.confidence
+
+    if is_crypto(ticker):
+        qty     = round(dollars / current_price, 6)
+        qty_str = str(qty)
+        tif     = 'gtc'
+    else:
+        qty = int(dollars / current_price)
+        if qty < 1:
+            logger.info(f"Scale-in too small for {ticker} — skipping")
+            return
+        qty_str = str(qty)
+        tif     = 'day'
+
+    try:
+        api.submit_order(
+            symbol=order_symbol,
+            qty=qty_str,
+            side='buy',
+            type='market',
+            time_in_force=tif,
+        )
+        _daily_trades += 1
+        logger.success(
+            f"📈 SCALE-IN {qty_str} {ticker} @ ~${current_price:.2f} | "
+            f"unrealized={unrealized_pct:.1%} | "
+            f"conf={signal.confidence:.0%} | Bellafiore pyramiding"
+        )
+    except Exception as e:
+        logger.error(f"Scale-in order failed for {ticker}: {e}")
+
+
+# Tracks symbols for which a TP/SL sell order has already been submitted
+# this cycle, preventing duplicate orders when check_exits() fires again
+# before the first order has filled.
+_pending_exits: set[str] = set()
+
+
 def check_exits():
     """Manually enforce take-profit and stop-loss for crypto positions."""
+    global _pending_exits
+
     try:
         positions = api.list_positions()
     except Exception as e:
         logger.warning(f"Could not fetch positions for exit check: {e}")
         return
+
+    # Clear stale pending-exit locks for symbols no longer held
+    current_symbols = {p.symbol for p in positions}
+    _pending_exits  = {s for s in _pending_exits if s in current_symbols}
 
     for pos in positions:
         symbol         = pos.symbol
@@ -138,21 +284,29 @@ def check_exits():
         stop        = config.CRYPTO_STOP_LOSS_PCT   if is_crypto(internal) else config.STOP_LOSS_PCT
 
         if unrealized_pct >= take_profit:
+            if symbol in _pending_exits:
+                logger.debug(f"TP sell already pending for {symbol} — skipping duplicate")
+                continue
             logger.info(f"Take-profit triggered for {symbol} at +{unrealized_pct:.1%}")
             try:
                 qty_clean = str(float(pos.qty))
                 api.submit_order(symbol=symbol, qty=qty_clean, side='sell',
                                  type='market', time_in_force='gtc')
+                _pending_exits.add(symbol)
                 _pending_buys.discard(internal)
             except Exception as e:
                 logger.error(f"Take-profit order failed for {symbol}: {e}")
 
         elif unrealized_pct <= -stop:
+            if symbol in _pending_exits:
+                logger.debug(f"SL sell already pending for {symbol} — skipping duplicate")
+                continue
             logger.info(f"Stop-loss triggered for {symbol} at {unrealized_pct:.1%}")
             try:
                 qty_clean = str(float(pos.qty))
                 api.submit_order(symbol=symbol, qty=qty_clean, side='sell',
                                  type='market', time_in_force='gtc')
+                _pending_exits.add(symbol)
                 _pending_buys.discard(internal)
             except Exception as e:
                 logger.error(f"Stop-loss order failed for {symbol}: {e}")
@@ -163,8 +317,6 @@ def execute_signal(signal: Signal):
     global _daily_trades
 
     _reset_daily_counter_if_needed()
-    # NOTE: _sync_daily_trades_from_api() is NO LONGER called here.
-    # It runs on its own DAILY_SYNC_INTERVAL schedule via sync_daily_counter().
 
     if signal.action == 'HOLD':
         logger.info(f"HOLD {signal.ticker} — {signal.reason}")
@@ -176,12 +328,22 @@ def execute_signal(signal: Signal):
         return
 
     open_positions = get_open_positions()
+    order_symbol   = to_order_symbol(signal.ticker)
+
+    # ── Pyramiding check ──────────────────────────────────────
+    # If the signal says to add to winner AND we already have a position,
+    # route to scale_in_winner() instead of a normal entry order.
+    if signal.action == 'BUY' and signal.add_to_winner and already_in_position(signal.ticker):
+        logger.info(f"Pyramiding check for {signal.ticker} — delegating to scale_in_winner()")
+        scale_in_winner(signal.ticker, signal)
+        return
+
     if signal.action == 'BUY' and len(open_positions) >= config.MAX_OPEN_POSITIONS:
         logger.warning("Max open positions reached — skipping BUY")
         return
 
     if signal.action == 'BUY':
-        # Layer 1: in-memory lock (fast)
+        # Layer 1: in-memory lock
         if signal.ticker in _pending_buys:
             logger.debug(f"{signal.ticker} buy already pending (in-memory) — skipping")
             return
@@ -200,17 +362,25 @@ def execute_signal(signal: Signal):
         logger.debug(f"No position in {signal.ticker} — cached SELL signal skipped")
         return
 
-    risk         = config.CRYPTO_RISK_PER_TRADE if is_crypto(signal.ticker) else config.RISK_PER_TRADE
-    stop         = config.CRYPTO_STOP_LOSS_PCT  if is_crypto(signal.ticker) else config.STOP_LOSS_PCT
-    portfolio    = get_portfolio_value()
-    order_symbol = to_order_symbol(signal.ticker)
+    # ── Position sizing ───────────────────────────────────────
+    risk = config.CRYPTO_RISK_PER_TRADE if is_crypto(signal.ticker) else config.RISK_PER_TRADE
 
-    if is_crypto(signal.ticker):
-        request = CryptoLatestBarRequest(symbol_or_symbols=order_symbol)
-        bar     = _crypto_client.get_crypto_latest_bar(request)
-        price   = float(bar[order_symbol].close)
-    else:
-        price = float(api.get_latest_trade(signal.ticker).price)
+    # Elliott Wave 5 caution: halve the risk per trade
+    if signal.wave5_caution:
+        risk *= 0.50
+        logger.warning(
+            f"⚠ Wave 5 caution active for {signal.ticker} — "
+            f"risk halved to {risk:.2%} of portfolio"
+        )
+
+    stop         = config.CRYPTO_STOP_LOSS_PCT if is_crypto(signal.ticker) else config.STOP_LOSS_PCT
+    portfolio    = get_portfolio_value()
+    price        = _get_current_price(signal.ticker, order_symbol)
+
+    if price is None:
+        logger.error(f"Cannot get price for {signal.ticker} — skipping order")
+        _pending_buys.discard(signal.ticker)
+        return
 
     dollars = portfolio * risk * signal.confidence
 
@@ -248,9 +418,12 @@ def execute_signal(signal: Signal):
             time_in_force=time_in_force,
         )
         _daily_trades += 1
+
+        trap_tag = ' [TRAP FLIP]' if signal.trap_flip else ''
+        w5_tag   = ' [W5 CAUTION]' if signal.wave5_caution else ''
         logger.success(
-            f"✅ {signal.action} {qty_str} {signal.ticker} @ ~${price:.2f} | "
-            f"conf={signal.confidence:.0%} | {signal.reason}"
+            f"✅ {signal.action}{trap_tag}{w5_tag} {qty_str} {signal.ticker} "
+            f"@ ~${price:.2f} | conf={signal.confidence:.0%} | {signal.reason}"
         )
 
         if signal.action == 'SELL':

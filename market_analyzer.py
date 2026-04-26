@@ -1,454 +1,655 @@
-# market_analyzer.py — multi-timeframe TA + SMC engine (v2)
+# market_analyzer.py — multi-timeframe TA + SMC + Advanced TA analysis (v3)
 # ─────────────────────────────────────────────────────────────
-# Changes from v1:
-#   - Parallelised bar fetching (ThreadPoolExecutor) — ~2s faster per cycle
-#   - RSI: bearish_zone now casts 0 (neutral), not -0.5 (was silently penalising flat markets)
-#   - RSI: neutral zone (45–55) explicitly casts 0
-#   - MACD: bullish_cross / bearish_cross carry higher weight than plain bullish / bearish
-#   - Volume: now uses candle direction (from VolumeResult.direction), not EMA state
-#   - Fibonacci: uses fixed at_support / at_resistance flags — logic was inverted in v1
-#   - Trend regression window now 80 bars (passed through to trend_structure)
-#   - NEW: SMC vote layer — order blocks, FVGs, BOS/CHoCH, liquidity sweeps
-#   - TOTAL_WEIGHT constant removed (was computed but never used)
+# Produces an AnalysisResult by running all indicator votes across
+# 1m / 1h / 1d timeframes and aggregating into bull/bear/net scores.
+#
+# v3 additions (integrated from market_analyzer_additions.py):
+#   - AnalysisResult extended with alligator_sleeping, wave5_warning,
+#     trap_active, trap_signal flags
+#   - INDICATOR_WEIGHTS extended with 7 new v3 indicators
+#   - analyze() extended with vote blocks 16-22 (AVWAP, Alligator, AO,
+#     Fractals, RVOL, Trap Detector, Elliott Divergence)
 # ─────────────────────────────────────────────────────────────
 from __future__ import annotations
-from dataclasses import dataclass, field
-from loguru import logger
-from typing import Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import pandas as pd
 
-from market_data import fetch_multi_timeframe, get_current_price
+from dataclasses import dataclass, field
+from typing import Optional
+from loguru import logger
+
+import config
+from market_data import fetch_multi_timeframe
 from indicators import (
-    ema_cross, macd, rsi, bollinger_bands, atr,
-    volume_analysis, detect_swing_levels, fibonacci_retracements,
-    trend_structure, order_blocks, fair_value_gaps,
-    break_of_structure, liquidity_sweep,
-    EMASignal, MACDResult, RSIResult,
-    BollingerResult, ATRResult, VolumeResult, SwingLevel,
-    FiboResult, TrendStructure,
+    # ── core TA ──────────────────────────────────────────────
+    ema_cross,
+    rsi,
+    macd,
+    bollinger_bands,
+    atr,
+    # ── SMC ──────────────────────────────────────────────────
+    order_block,
+    fair_value_gap,
+    bos_choch,
+    liquidity_sweep,
+    # ── v3 Advanced TA ───────────────────────────────────────
+    avwap_pinch,
+    alligator,
+    awesome_oscillator,
+    fractals,
+    volume_relative,
+    trap_detector,
+    elliott_divergence,
+    # ── result types (v3) ────────────────────────────────────
+    AVWAPPinchResult,
+    AlligatorResult,
+    AOResult,
+    FractalResult,
+    RelativeVolumeResult,
+    TrapResult,
+    ElliottDivergenceResult,
 )
 
 
-# ──────────────────────────────────────────────────────────────
-# INDICATOR WEIGHTS
-# ──────────────────────────────────────────────────────────────
-
-INDICATOR_WEIGHTS: dict[str, float] = {
-    # Trend — most reliable for crypto swing trades
-    'ema_cross_1h':       3.0,
-    'macd_1h':            2.5,
-    'trend_1d':           2.5,
-    # Momentum
-    'rsi_1h':             2.0,
-    'rsi_1d':             1.5,
-    # Volatility / structure
-    'bollinger_1h':       1.5,
-    'fibo_proximity':     2.0,
-    'swing_proximity':    1.5,
-    # Volume — now independent of EMA state
-    'volume_1h':          1.5,
-    # Short-term trigger
-    'ema_cross_1m':       1.0,
-    'macd_1m':            1.0,
-    # ── SMC layer (new in v2) ─────────────────────────────────
-    'smc_order_block':    2.5,   # price at/near an unmitigated OB
-    'smc_fvg':            1.5,   # price at an unfilled FVG
-    'smc_bos_choch':      2.0,   # BOS or CHoCH event (recent)
-    'smc_liquidity':      2.5,   # liquidity sweep + reversal (highest confluence)
-}
-
+# ══════════════════════════════════════════════════════════════
+# DATA STRUCTURES
+# ══════════════════════════════════════════════════════════════
 
 @dataclass
 class IndicatorVote:
-    name: str
-    vote: int       # +1, 0, -1
+    """A single indicator's directional vote."""
+    name:   str
+    vote:   int    # +1 = bull, -1 = bear, 0 = neutral
     weight: float
     reason: str
 
 
 @dataclass
 class AnalysisResult:
-    ticker: str
-    price: float
-    bull_score: float    # 0.0–1.0
-    bear_score: float    # 0.0–1.0
-    net_score: float     # -1.0 to +1.0
-    votes: list[IndicatorVote] = field(default_factory=list)
-    atr_pct: float = 0.0
-    nearest_support: float = 0.0
-    nearest_resistance: float = 0.0
-    trend: str = 'ranging'
-    summary: str = ''
+    """Aggregated multi-indicator analysis for one ticker."""
+    ticker:      str
+    trend:       str          # 'uptrend' | 'downtrend' | 'sideways'
+    bull_score:  float        # 0.0–1.0
+    bear_score:  float        # 0.0–1.0
+    net_score:   float        # -1.0 to +1.0  (bull - bear, weighted)
+    votes:       list[IndicatorVote] = field(default_factory=list)
+    summary:     str = ''
+
+    # ── v3 flags (checked by signal_generator.py) ────────────
+    alligator_sleeping: bool = False   # True → market choppy → force HOLD
+    wave5_warning:      bool = False   # True → Elliott W5 divergence → reduce size
+    trap_active:        bool = False   # True → trap pattern present → flip signal
+    trap_signal:        str  = 'none'  # 'buy' | 'sell' | 'none'
 
 
-def _fetch_bars_parallel(ticker: str) -> dict[str, pd.DataFrame]:
+# ══════════════════════════════════════════════════════════════
+# INDICATOR WEIGHTS
+# ══════════════════════════════════════════════════════════════
+
+INDICATOR_WEIGHTS: dict[str, float] = {
+    # ── Core TA ──────────────────────────────────────────────
+    'ema_cross':           2.0,
+    'rsi':                 1.5,
+    'macd':                1.5,
+    'bollinger':           1.0,
+    'atr_trend':           0.5,
+
+    # ── SMC ──────────────────────────────────────────────────
+    'smc_order_block':     2.5,
+    'smc_fvg':             2.0,
+    'smc_bos_choch':       2.5,
+    'smc_liquidity':       2.0,
+
+    # ── v3: Brian Shannon — Anchored VWAP ────────────────────
+    'avwap_pinch':         2.5,
+
+    # ── v3: Bill Williams — Natural Order System ─────────────
+    'williams_alligator':  2.0,
+    'williams_ao':         1.5,
+    'williams_fractals':   1.5,
+
+    # ── v3: Bellafiore — volume filter ───────────────────────
+    'rvol_filter':         1.5,
+
+    # ── v3: Schwager — trap detector ─────────────────────────
+    'trap_detector':       3.0,   # highest weight — fastest moves
+
+    # ── v3: Elliott Wave — wave personality ──────────────────
+    'elliott_divergence':  2.0,
+}
+
+
+# ══════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def _aggregate(votes: list[IndicatorVote]) -> tuple[float, float, float]:
     """
-    Fetch 1m / 1h / 1d bars concurrently to cut cycle time by ~2s.
-    Falls back to sequential if the executor fails.
+    Aggregate votes into (bull_score, bear_score, net_score).
+
+    bull_score = weighted bull votes / total weight (0-1)
+    bear_score = weighted bear votes / total weight (0-1)
+    net_score  = (bull_weighted - bear_weighted) / total_weight  (-1 to +1)
     """
-    from market_data import fetch_bars
-    from alpaca.data.timeframe import TimeFrame
+    total_weight = sum(v.weight for v in votes)
+    if total_weight == 0:
+        return 0.0, 0.0, 0.0
 
-    tasks = {
-        '1m': (ticker, TimeFrame.Minute, 100),
-        '1h': (ticker, TimeFrame.Hour,   200),
-        '1d': (ticker, TimeFrame.Day,    200),
-    }
-    results: dict[str, pd.DataFrame] = {}
+    bull_w = sum(v.weight for v in votes if v.vote == +1)
+    bear_w = sum(v.weight for v in votes if v.vote == -1)
 
+    bull_score = bull_w / total_weight
+    bear_score = bear_w / total_weight
+    net_score  = (bull_w - bear_w) / total_weight
+
+    return bull_score, bear_score, net_score
+
+
+def _trend_from_ema(df_1h) -> str:
+    """Determine broad trend from 1H EMA relationship."""
+    if df_1h.empty or len(df_1h) < config.EMA_SLOW + 5:
+        return 'sideways'
     try:
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            future_map = {
-                ex.submit(fetch_bars, t, tf, lim): key
-                for key, (t, tf, lim) in tasks.items()
-            }
-            for fut in as_completed(future_map):
-                key = future_map[fut]
-                try:
-                    results[key] = fut.result()
-                except Exception as e:
-                    logger.warning(f"Parallel bar fetch failed for {key}: {e}")
-                    results[key] = pd.DataFrame()
-    except Exception as e:
-        logger.warning(f"ThreadPoolExecutor failed — falling back to sequential: {e}")
-        results = fetch_multi_timeframe(ticker)
+        import pandas as pd
+        fast = df_1h['close'].ewm(span=config.EMA_FAST, adjust=False).mean()
+        slow = df_1h['close'].ewm(span=config.EMA_SLOW, adjust=False).mean()
+        if float(fast.iloc[-1]) > float(slow.iloc[-1]) * 1.002:
+            return 'uptrend'
+        if float(fast.iloc[-1]) < float(slow.iloc[-1]) * 0.998:
+            return 'downtrend'
+        return 'sideways'
+    except Exception:
+        return 'sideways'
 
-    return results
 
+# ══════════════════════════════════════════════════════════════
+# MAIN ANALYSIS FUNCTION
+# ══════════════════════════════════════════════════════════════
 
 def analyze(ticker: str) -> Optional[AnalysisResult]:
     """
-    Run full multi-timeframe TA + SMC analysis for a crypto ticker.
-    Returns AnalysisResult or None if insufficient data.
-    """
-    bars  = _fetch_bars_parallel(ticker)
-    df_1m = bars.get('1m', pd.DataFrame())
-    df_1h = bars.get('1h', pd.DataFrame())
-    df_1d = bars.get('1d', pd.DataFrame())
+    Run full multi-timeframe analysis for a ticker and return AnalysisResult.
 
-    price = get_current_price(ticker)
-    if price is None:
-        logger.warning(f"Cannot analyze {ticker} — no price data")
+    Returns None if data is insufficient for a meaningful signal.
+    """
+    bars = fetch_multi_timeframe(ticker)
+    df_1m = bars.get('1m')
+    df_1h = bars.get('1h')
+    df_1d = bars.get('1d')
+
+    # Need at least 1H data to do anything meaningful
+    if df_1h is None or df_1h.empty or len(df_1h) < 30:
+        logger.warning(f"Insufficient 1H data for {ticker} — skipping analysis")
         return None
 
     votes: list[IndicatorVote] = []
-
-    # ── 1. EMA Cross — 1H ─────────────────────────────────────
-    ec_1h = ema_cross(df_1h) if not df_1h.empty else None
-    if ec_1h:
-        if ec_1h.cross == 'golden':
-            votes.append(IndicatorVote('ema_cross_1h', +1, INDICATOR_WEIGHTS['ema_cross_1h'],
-                'Golden cross 1H'))
-        elif ec_1h.cross == 'death':
-            votes.append(IndicatorVote('ema_cross_1h', -1, INDICATOR_WEIGHTS['ema_cross_1h'],
-                'Death cross 1H'))
-        elif ec_1h.cross == 'above' and ec_1h.slope_pct > 0.1:
-            votes.append(IndicatorVote('ema_cross_1h', +1, INDICATOR_WEIGHTS['ema_cross_1h'],
-                f'EMA fast above slow, rising {ec_1h.slope_pct:.2f}%/bar'))
-        elif ec_1h.cross == 'below' and ec_1h.slope_pct < -0.1:
-            votes.append(IndicatorVote('ema_cross_1h', -1, INDICATOR_WEIGHTS['ema_cross_1h'],
-                f'EMA fast below slow, falling {ec_1h.slope_pct:.2f}%/bar'))
-        else:
-            votes.append(IndicatorVote('ema_cross_1h', 0, INDICATOR_WEIGHTS['ema_cross_1h'],
-                'EMA flat/neutral'))
-
-    # ── 2. MACD — 1H ──────────────────────────────────────────
-    # FIX: bullish_cross carries full weight, plain 'bullish' carries 60% (weaker signal)
-    mc_1h = macd(df_1h) if not df_1h.empty else None
-    if mc_1h:
-        if mc_1h.divergence == 'bullish_cross':
-            votes.append(IndicatorVote('macd_1h', +1, INDICATOR_WEIGHTS['macd_1h'],
-                f'MACD zero-line cross bullish 1H (hist={mc_1h.hist:+.4f})'))
-        elif mc_1h.divergence == 'bearish_cross':
-            votes.append(IndicatorVote('macd_1h', -1, INDICATOR_WEIGHTS['macd_1h'],
-                f'MACD zero-line cross bearish 1H (hist={mc_1h.hist:+.4f})'))
-        elif mc_1h.divergence == 'bullish':
-            votes.append(IndicatorVote('macd_1h', +1, INDICATOR_WEIGHTS['macd_1h'] * 0.6,
-                f'MACD hist expanding bullish 1H ({mc_1h.hist:+.4f})'))
-        elif mc_1h.divergence == 'bearish':
-            votes.append(IndicatorVote('macd_1h', -1, INDICATOR_WEIGHTS['macd_1h'] * 0.6,
-                f'MACD hist expanding bearish 1H ({mc_1h.hist:+.4f})'))
-        else:
-            votes.append(IndicatorVote('macd_1h', 0, INDICATOR_WEIGHTS['macd_1h'],
-                'MACD neutral 1H'))
-
-    # ── 3. Trend Structure — 1D ────────────────────────────────
-    ts_1d = trend_structure(df_1d, regression_bars=80) if not df_1d.empty else None
-    if ts_1d:
-        if ts_1d.direction == 'uptrend' and ts_1d.strength > 0.6:
-            votes.append(IndicatorVote('trend_1d', +1, INDICATOR_WEIGHTS['trend_1d'],
-                f'Daily uptrend R²={ts_1d.strength:.2f}'))
-        elif ts_1d.direction == 'downtrend' and ts_1d.strength > 0.6:
-            votes.append(IndicatorVote('trend_1d', -1, INDICATOR_WEIGHTS['trend_1d'],
-                f'Daily downtrend R²={ts_1d.strength:.2f} (bear market)'))
-        else:
-            votes.append(IndicatorVote('trend_1d', 0, INDICATOR_WEIGHTS['trend_1d'],
-                'No clear daily trend'))
-
-    # ── 4. RSI — 1H ───────────────────────────────────────────
-    # FIX: bearish_zone → 0 vote (not -0.5); neutral → 0 vote
-    rsi_1h = rsi(df_1h) if not df_1h.empty else None
-    if rsi_1h:
-        if rsi_1h.zone == 'oversold':
-            votes.append(IndicatorVote('rsi_1h', +1, INDICATOR_WEIGHTS['rsi_1h'],
-                f'RSI 1H oversold ({rsi_1h.value:.1f})'))
-        elif rsi_1h.zone == 'overbought':
-            votes.append(IndicatorVote('rsi_1h', -1, INDICATOR_WEIGHTS['rsi_1h'],
-                f'RSI 1H overbought ({rsi_1h.value:.1f})'))
-        elif rsi_1h.zone == 'bullish_zone':
-            votes.append(IndicatorVote('rsi_1h', +1, INDICATOR_WEIGHTS['rsi_1h'] * 0.5,
-                f'RSI 1H bullish zone ({rsi_1h.value:.1f})'))
-        else:
-            # bearish_zone and neutral both cast 0 — neither is a strong directional signal
-            votes.append(IndicatorVote('rsi_1h', 0, INDICATOR_WEIGHTS['rsi_1h'],
-                f'RSI 1H neutral/weak ({rsi_1h.value:.1f})'))
-
-    # ── 5. RSI — 1D ───────────────────────────────────────────
-    rsi_1d = rsi(df_1d) if not df_1d.empty else None
-    if rsi_1d:
-        if rsi_1d.zone == 'oversold':
-            votes.append(IndicatorVote('rsi_1d', +1, INDICATOR_WEIGHTS['rsi_1d'],
-                f'RSI 1D oversold ({rsi_1d.value:.1f}) — strong bounce candidate'))
-        elif rsi_1d.zone == 'overbought':
-            votes.append(IndicatorVote('rsi_1d', -1, INDICATOR_WEIGHTS['rsi_1d'],
-                f'RSI 1D overbought ({rsi_1d.value:.1f})'))
-        else:
-            votes.append(IndicatorVote('rsi_1d', 0, INDICATOR_WEIGHTS['rsi_1d'],
-                f'RSI 1D neutral ({rsi_1d.value:.1f})'))
-
-    # ── 6. Bollinger Bands — 1H ───────────────────────────────
-    bb_1h = bollinger_bands(df_1h) if not df_1h.empty else None
-    if bb_1h:
-        if bb_1h.signal == 'breakout_up':
-            votes.append(IndicatorVote('bollinger_1h', +1, INDICATOR_WEIGHTS['bollinger_1h'],
-                'BB breakout above upper band'))
-        elif bb_1h.signal == 'breakout_down':
-            votes.append(IndicatorVote('bollinger_1h', -1, INDICATOR_WEIGHTS['bollinger_1h'],
-                'BB breakdown below lower band'))
-        elif bb_1h.signal == 'squeeze':
-            votes.append(IndicatorVote('bollinger_1h', 0, INDICATOR_WEIGHTS['bollinger_1h'],
-                f'BB squeeze ({bb_1h.width_pct:.1f}%) — breakout imminent'))
-        elif bb_1h.price_position < 0.2:
-            votes.append(IndicatorVote('bollinger_1h', +1, INDICATOR_WEIGHTS['bollinger_1h'],
-                'Price at lower BB — mean reversion potential'))
-        elif bb_1h.price_position > 0.8:
-            votes.append(IndicatorVote('bollinger_1h', -1, INDICATOR_WEIGHTS['bollinger_1h'],
-                'Price at upper BB — potential rejection'))
-        else:
-            votes.append(IndicatorVote('bollinger_1h', 0, INDICATOR_WEIGHTS['bollinger_1h'],
-                'Price mid-bands'))
-
-    # ── 7. Fibonacci Proximity — 1D ───────────────────────────
-    # FIX: uses at_support / at_resistance from corrected FiboResult
-    fibo = fibonacci_retracements(df_1d) if not df_1d.empty else None
-    if fibo:
-        if fibo.nearest_level in [0.382, 0.5, 0.618]:
-            if fibo.at_support:
-                votes.append(IndicatorVote('fibo_proximity', +1, INDICATOR_WEIGHTS['fibo_proximity'],
-                    f'At {fibo.nearest_level:.1%} Fib support — whale buy zone ({fibo.distance_pct:.1f}% away)'))
-            elif fibo.at_resistance:
-                votes.append(IndicatorVote('fibo_proximity', -1, INDICATOR_WEIGHTS['fibo_proximity'],
-                    f'Approaching {fibo.nearest_level:.1%} Fib resistance ({fibo.distance_pct:.1f}% away)'))
-            else:
-                votes.append(IndicatorVote('fibo_proximity', 0, INDICATOR_WEIGHTS['fibo_proximity'],
-                    f'Near {fibo.nearest_level:.1%} Fib but not close enough ({fibo.distance_pct:.1f}% away)'))
-        else:
-            votes.append(IndicatorVote('fibo_proximity', 0, INDICATOR_WEIGHTS['fibo_proximity'],
-                f'Near minor Fib {fibo.nearest_level:.1%} ({fibo.distance_pct:.1f}% away)'))
-
-    # ── 8. Swing Level Proximity — 1D ─────────────────────────
-    swings             = detect_swing_levels(df_1d) if not df_1d.empty else []
-    nearest_support    = 0.0
-    nearest_resistance = 0.0
-
-    if swings:
-        supports = [s for s in swings if s.label == 'support'    and s.direction == 'below']
-        resists  = [r for r in swings if r.label == 'resistance' and r.direction == 'above']
-
-        if supports:
-            nearest_support = supports[0].level
-            if supports[0].distance_pct < 3.0:
-                votes.append(IndicatorVote('swing_proximity', +1, INDICATOR_WEIGHTS['swing_proximity'],
-                    f'Near major support ${nearest_support:,.0f} ({supports[0].distance_pct:.1f}% below)'))
-            else:
-                votes.append(IndicatorVote('swing_proximity', 0, INDICATOR_WEIGHTS['swing_proximity'],
-                    f'Support ${nearest_support:,.0f} is {supports[0].distance_pct:.1f}% away'))
-
-        if resists:
-            nearest_resistance = resists[0].level
-            if resists[0].distance_pct < 3.0:
-                votes.append(IndicatorVote('swing_proximity', -1, INDICATOR_WEIGHTS['swing_proximity'],
-                    f'Approaching resistance ${nearest_resistance:,.0f} ({resists[0].distance_pct:.1f}% above)'))
-    else:
-        votes.append(IndicatorVote('swing_proximity', 0, INDICATOR_WEIGHTS['swing_proximity'],
-            'No clear swing levels detected'))
-
-    # ── 9. Volume — 1H ────────────────────────────────────────
-    # FIX: uses VolumeResult.direction (candle body), not EMA state
-    vol_1h = volume_analysis(df_1h) if not df_1h.empty else None
-    if vol_1h:
-        if vol_1h.spike:
-            if vol_1h.direction == 'bullish':
-                votes.append(IndicatorVote('volume_1h', +1, INDICATOR_WEIGHTS['volume_1h'],
-                    f'Volume spike x{vol_1h.ratio:.1f} on bullish candle'))
-            elif vol_1h.direction == 'bearish':
-                votes.append(IndicatorVote('volume_1h', -1, INDICATOR_WEIGHTS['volume_1h'],
-                    f'Volume spike x{vol_1h.ratio:.1f} on bearish candle'))
-            else:
-                votes.append(IndicatorVote('volume_1h', 0, INDICATOR_WEIGHTS['volume_1h'],
-                    f'Volume spike x{vol_1h.ratio:.1f} — doji/neutral candle'))
-        else:
-            votes.append(IndicatorVote('volume_1h', 0, INDICATOR_WEIGHTS['volume_1h'],
-                f'Normal volume (x{vol_1h.ratio:.1f} avg)'))
-
-    # ── 10. EMA Cross — 1M ────────────────────────────────────
-    ec_1m = ema_cross(df_1m) if not df_1m.empty else None
-    if ec_1m:
-        if ec_1m.cross == 'golden':
-            votes.append(IndicatorVote('ema_cross_1m', +1, INDICATOR_WEIGHTS['ema_cross_1m'],
-                'Golden cross 1M — short-term trigger'))
-        elif ec_1m.cross == 'death':
-            votes.append(IndicatorVote('ema_cross_1m', -1, INDICATOR_WEIGHTS['ema_cross_1m'],
-                'Death cross 1M — short-term trigger'))
-        else:
-            votes.append(IndicatorVote('ema_cross_1m', 0, INDICATOR_WEIGHTS['ema_cross_1m'],
-                'No 1M cross signal'))
-
-    # ── 11. MACD — 1M ─────────────────────────────────────────
-    mc_1m = macd(df_1m) if not df_1m.empty else None
-    if mc_1m:
-        if mc_1m.divergence in ('bullish_cross', 'bullish'):
-            votes.append(IndicatorVote('macd_1m', +1, INDICATOR_WEIGHTS['macd_1m'],
-                f'MACD 1M bullish ({mc_1m.divergence})'))
-        elif mc_1m.divergence in ('bearish_cross', 'bearish'):
-            votes.append(IndicatorVote('macd_1m', -1, INDICATOR_WEIGHTS['macd_1m'],
-                f'MACD 1M bearish ({mc_1m.divergence})'))
-        else:
-            votes.append(IndicatorVote('macd_1m', 0, INDICATOR_WEIGHTS['macd_1m'],
-                'MACD 1M neutral'))
+    trend = _trend_from_ema(df_1h)
 
     # ══════════════════════════════════════════════════════════
-    # SMC VOTE LAYER (new in v2)
+    # CORE TA LAYER (votes 1–5)
     # ══════════════════════════════════════════════════════════
 
-    # ── 12. Order Blocks — 1H ─────────────────────────────────
-    obs_1h = order_blocks(df_1h, impulse_pct=1.2) if not df_1h.empty else []
-    if obs_1h:
-        # Find the nearest unmitigated OB
-        unmitigated = [o for o in obs_1h if not o.mitigated]
-        if unmitigated:
-            nearest_ob = min(unmitigated, key=lambda x: x.distance_pct)
-            if nearest_ob.distance_pct < 2.0:
-                if nearest_ob.ob_type == 'bullish':
-                    votes.append(IndicatorVote('smc_order_block', +1, INDICATOR_WEIGHTS['smc_order_block'],
-                        f'Price at bullish OB ${nearest_ob.bottom:,.0f}–${nearest_ob.top:,.0f} '
-                        f'({nearest_ob.distance_pct:.1f}% away)'))
+    # ── 1. EMA Cross — 1H ────────────────────────────────────
+    try:
+        ema = ema_cross(df_1h, fast=config.EMA_FAST, slow=config.EMA_SLOW)
+        if ema is not None:
+            if ema.cross_up:
+                votes.append(IndicatorVote('ema_cross', +1, INDICATOR_WEIGHTS['ema_cross'],
+                    f'EMA{config.EMA_FAST} crossed above EMA{config.EMA_SLOW} (1H)'))
+            elif ema.cross_down:
+                votes.append(IndicatorVote('ema_cross', -1, INDICATOR_WEIGHTS['ema_cross'],
+                    f'EMA{config.EMA_FAST} crossed below EMA{config.EMA_SLOW} (1H)'))
+            elif ema.fast_above_slow:
+                votes.append(IndicatorVote('ema_cross', +1, INDICATOR_WEIGHTS['ema_cross'] * 0.5,
+                    f'EMA{config.EMA_FAST} above EMA{config.EMA_SLOW} — bullish bias (1H)'))
+            else:
+                votes.append(IndicatorVote('ema_cross', -1, INDICATOR_WEIGHTS['ema_cross'] * 0.5,
+                    f'EMA{config.EMA_FAST} below EMA{config.EMA_SLOW} — bearish bias (1H)'))
+    except Exception as e:
+        logger.debug(f"EMA cross error ({ticker}): {e}")
+
+    # ── 2. RSI — 1H ──────────────────────────────────────────
+    try:
+        rsi_result = rsi(df_1h, period=config.RSI_PERIOD)
+        if rsi_result is not None:
+            val = rsi_result.value
+            if val <= 30:
+                votes.append(IndicatorVote('rsi', +1, INDICATOR_WEIGHTS['rsi'],
+                    f'RSI oversold ({val:.1f}) — 1H'))
+            elif val >= 70:
+                votes.append(IndicatorVote('rsi', -1, INDICATOR_WEIGHTS['rsi'],
+                    f'RSI overbought ({val:.1f}) — 1H'))
+            elif val >= 55:
+                votes.append(IndicatorVote('rsi', +1, INDICATOR_WEIGHTS['rsi'] * 0.4,
+                    f'RSI bullish zone ({val:.1f}) — 1H'))
+            elif val <= 45:
+                votes.append(IndicatorVote('rsi', -1, INDICATOR_WEIGHTS['rsi'] * 0.4,
+                    f'RSI bearish zone ({val:.1f}) — 1H'))
+            else:
+                votes.append(IndicatorVote('rsi', 0, INDICATOR_WEIGHTS['rsi'],
+                    f'RSI neutral ({val:.1f}) — 1H'))
+    except Exception as e:
+        logger.debug(f"RSI error ({ticker}): {e}")
+
+    # ── 3. MACD — 1H ─────────────────────────────────────────
+    try:
+        macd_result = macd(df_1h,
+                           fast=config.MACD_FAST,
+                           slow=config.MACD_SLOW,
+                           signal=config.MACD_SIGNAL)
+        if macd_result is not None:
+            if macd_result.cross_up:
+                votes.append(IndicatorVote('macd', +1, INDICATOR_WEIGHTS['macd'],
+                    f'MACD bullish cross (hist={macd_result.histogram:+.4f}) — 1H'))
+            elif macd_result.cross_down:
+                votes.append(IndicatorVote('macd', -1, INDICATOR_WEIGHTS['macd'],
+                    f'MACD bearish cross (hist={macd_result.histogram:+.4f}) — 1H'))
+            elif macd_result.histogram > 0:
+                votes.append(IndicatorVote('macd', +1, INDICATOR_WEIGHTS['macd'] * 0.5,
+                    f'MACD histogram positive ({macd_result.histogram:+.4f}) — 1H'))
+            else:
+                votes.append(IndicatorVote('macd', -1, INDICATOR_WEIGHTS['macd'] * 0.5,
+                    f'MACD histogram negative ({macd_result.histogram:+.4f}) — 1H'))
+    except Exception as e:
+        logger.debug(f"MACD error ({ticker}): {e}")
+
+    # ── 4. Bollinger Bands — 1H ───────────────────────────────
+    try:
+        bb = bollinger_bands(df_1h, period=config.BB_PERIOD, std=config.BB_STD)
+        if bb is not None:
+            current_close = float(df_1h['close'].iloc[-1])
+            if current_close <= bb.lower:
+                votes.append(IndicatorVote('bollinger', +1, INDICATOR_WEIGHTS['bollinger'],
+                    f'Price at/below lower BB (${bb.lower:,.0f}) — 1H'))
+            elif current_close >= bb.upper:
+                votes.append(IndicatorVote('bollinger', -1, INDICATOR_WEIGHTS['bollinger'],
+                    f'Price at/above upper BB (${bb.upper:,.0f}) — 1H'))
+            else:
+                votes.append(IndicatorVote('bollinger', 0, INDICATOR_WEIGHTS['bollinger'],
+                    f'Price inside BBands — 1H'))
+    except Exception as e:
+        logger.debug(f"Bollinger error ({ticker}): {e}")
+
+    # ── 5. ATR trend confirmation — 1D ───────────────────────
+    try:
+        if df_1d is not None and not df_1d.empty and len(df_1d) >= config.ATR_PERIOD + 5:
+            atr_result = atr(df_1d, period=config.ATR_PERIOD)
+            if atr_result is not None:
+                # High ATR = expanding volatility. Combine with trend for vote.
+                atr_pct = atr_result.value / float(df_1d['close'].iloc[-1]) * 100
+                if atr_pct > 3.0 and trend == 'uptrend':
+                    votes.append(IndicatorVote('atr_trend', +1, INDICATOR_WEIGHTS['atr_trend'],
+                        f'High ATR ({atr_pct:.1f}%) in uptrend — 1D'))
+                elif atr_pct > 3.0 and trend == 'downtrend':
+                    votes.append(IndicatorVote('atr_trend', -1, INDICATOR_WEIGHTS['atr_trend'],
+                        f'High ATR ({atr_pct:.1f}%) in downtrend — 1D'))
                 else:
-                    votes.append(IndicatorVote('smc_order_block', -1, INDICATOR_WEIGHTS['smc_order_block'],
-                        f'Price at bearish OB ${nearest_ob.bottom:,.0f}–${nearest_ob.top:,.0f} '
-                        f'({nearest_ob.distance_pct:.1f}% away)'))
+                    votes.append(IndicatorVote('atr_trend', 0, INDICATOR_WEIGHTS['atr_trend'],
+                        f'ATR ({atr_pct:.1f}%) — low conviction'))
+    except Exception as e:
+        logger.debug(f"ATR error ({ticker}): {e}")
+
+    # ══════════════════════════════════════════════════════════
+    # SMC LAYER (votes 6–15)
+    # ══════════════════════════════════════════════════════════
+
+    # ── 6. Order Block — 1H ──────────────────────────────────
+    try:
+        ob = order_block(df_1h,
+                         impulse_pct=config.SMC_OB_IMPULSE_PCT,
+                         proximity_pct=config.SMC_OB_PROXIMITY_PCT)
+        if ob is not None:
+            if ob.bullish_ob and ob.near_bullish:
+                votes.append(IndicatorVote('smc_order_block', +1, INDICATOR_WEIGHTS['smc_order_block'],
+                    f'Bullish OB at ${ob.bullish_level:,.0f} — price in proximity — 1H'))
+            elif ob.bearish_ob and ob.near_bearish:
+                votes.append(IndicatorVote('smc_order_block', -1, INDICATOR_WEIGHTS['smc_order_block'],
+                    f'Bearish OB at ${ob.bearish_level:,.0f} — price in proximity — 1H'))
             else:
                 votes.append(IndicatorVote('smc_order_block', 0, INDICATOR_WEIGHTS['smc_order_block'],
-                    f'Nearest OB {nearest_ob.distance_pct:.1f}% away — not in zone'))
-        else:
-            votes.append(IndicatorVote('smc_order_block', 0, INDICATOR_WEIGHTS['smc_order_block'],
-                'All nearby OBs mitigated'))
+                    'No order block proximity — 1H'))
+    except Exception as e:
+        logger.debug(f"Order block error ({ticker}): {e}")
 
-    # ── 13. Fair Value Gaps — 1H ──────────────────────────────
-    fvgs_1h = fair_value_gaps(df_1h, lookback=40) if not df_1h.empty else []
-    if fvgs_1h:
-        nearest_fvg = min(fvgs_1h, key=lambda x: x.distance_pct)
-        if nearest_fvg.distance_pct < 1.5:
-            if nearest_fvg.fvg_type == 'bullish':
-                # Bullish FVG below current price = support/magnet from below
+    # ── 7. Fair Value Gap — 1H ───────────────────────────────
+    try:
+        fvg = fair_value_gap(df_1h, proximity_pct=config.SMC_FVG_PROXIMITY_PCT)
+        if fvg is not None:
+            if fvg.bullish_fvg and fvg.price_in_bullish:
                 votes.append(IndicatorVote('smc_fvg', +1, INDICATOR_WEIGHTS['smc_fvg'],
-                    f'Bullish FVG below at ${nearest_fvg.bottom:,.0f}–${nearest_fvg.top:,.0f} '
-                    f'(fill magnet, {nearest_fvg.distance_pct:.1f}% away)'))
-            else:
-                # Bearish FVG above current price = resistance/magnet from above
+                    f'Bullish FVG [{fvg.bull_low:,.0f}–{fvg.bull_high:,.0f}] — price inside — 1H'))
+            elif fvg.bearish_fvg and fvg.price_in_bearish:
                 votes.append(IndicatorVote('smc_fvg', -1, INDICATOR_WEIGHTS['smc_fvg'],
-                    f'Bearish FVG above at ${nearest_fvg.bottom:,.0f}–${nearest_fvg.top:,.0f} '
-                    f'(fill magnet, {nearest_fvg.distance_pct:.1f}% away)'))
-        else:
-            votes.append(IndicatorVote('smc_fvg', 0, INDICATOR_WEIGHTS['smc_fvg'],
-                f'Nearest FVG {nearest_fvg.distance_pct:.1f}% away'))
-
-    # ── 14. Break of Structure — 1H ───────────────────────────
-    bos_1h = break_of_structure(df_1h, swing_lookback=20) if not df_1h.empty else None
-    if bos_1h:
-        if bos_1h.bars_ago <= 3:  # only act on fresh breaks
-            if bos_1h.event in ('bos_bullish', 'choch_bullish'):
-                label = 'BOS' if 'bos' in bos_1h.event else 'CHoCH'
-                votes.append(IndicatorVote('smc_bos_choch', +1, INDICATOR_WEIGHTS['smc_bos_choch'],
-                    f'{label} bullish 1H — broke ${bos_1h.broken_level:,.0f} '
-                    f'({bos_1h.bars_ago} bars ago, +{bos_1h.strength:.2f}%)'))
-            elif bos_1h.event in ('bos_bearish', 'choch_bearish'):
-                label = 'BOS' if 'bos' in bos_1h.event else 'CHoCH'
-                votes.append(IndicatorVote('smc_bos_choch', -1, INDICATOR_WEIGHTS['smc_bos_choch'],
-                    f'{label} bearish 1H — broke ${bos_1h.broken_level:,.0f} '
-                    f'({bos_1h.bars_ago} bars ago, -{bos_1h.strength:.2f}%)'))
-        else:
-            votes.append(IndicatorVote('smc_bos_choch', 0, INDICATOR_WEIGHTS['smc_bos_choch'],
-                f'Last structure break was {bos_1h.bars_ago} bars ago — stale'))
-    else:
-        votes.append(IndicatorVote('smc_bos_choch', 0, INDICATOR_WEIGHTS['smc_bos_choch'],
-            'No recent structure break detected'))
-
-    # ── 15. Liquidity Sweep — 1H ──────────────────────────────
-    sweep_1h = liquidity_sweep(df_1h, lookback=30) if not df_1h.empty else None
-    if sweep_1h:
-        if sweep_1h.bars_ago <= 2:  # sweep must be very recent
-            if sweep_1h.sweep_type == 'bullish_sweep':
-                votes.append(IndicatorVote('smc_liquidity', +1, INDICATOR_WEIGHTS['smc_liquidity'],
-                    f'Bullish liquidity sweep — wicked below ${sweep_1h.swept_level:,.0f} '
-                    f'and recovered ({sweep_1h.bars_ago} bars ago, wick={sweep_1h.wick_pct:.2f}%)'))
+                    f'Bearish FVG [{fvg.bear_low:,.0f}–{fvg.bear_high:,.0f}] — price inside — 1H'))
             else:
+                votes.append(IndicatorVote('smc_fvg', 0, INDICATOR_WEIGHTS['smc_fvg'],
+                    'No FVG proximity — 1H'))
+    except Exception as e:
+        logger.debug(f"FVG error ({ticker}): {e}")
+
+    # ── 8. BOS / CHoCH — 1H ──────────────────────────────────
+    try:
+        bos = bos_choch(df_1h, max_bars=config.SMC_BOS_MAX_BARS)
+        if bos is not None:
+            if bos.bullish_bos:
+                votes.append(IndicatorVote('smc_bos_choch', +1, INDICATOR_WEIGHTS['smc_bos_choch'],
+                    f'Bullish BOS — structure break up — 1H'))
+            elif bos.bearish_bos:
+                votes.append(IndicatorVote('smc_bos_choch', -1, INDICATOR_WEIGHTS['smc_bos_choch'],
+                    f'Bearish BOS — structure break down — 1H'))
+            elif bos.bullish_choch:
+                votes.append(IndicatorVote('smc_bos_choch', +1, INDICATOR_WEIGHTS['smc_bos_choch'],
+                    f'CHoCH bullish — trend reversal signal — 1H'))
+            elif bos.bearish_choch:
+                votes.append(IndicatorVote('smc_bos_choch', -1, INDICATOR_WEIGHTS['smc_bos_choch'],
+                    f'CHoCH bearish — trend reversal signal — 1H'))
+            else:
+                votes.append(IndicatorVote('smc_bos_choch', 0, INDICATOR_WEIGHTS['smc_bos_choch'],
+                    'No BOS/CHoCH — 1H'))
+    except Exception as e:
+        logger.debug(f"BOS/CHoCH error ({ticker}): {e}")
+
+    # ── 9. Liquidity Sweep — 1H ──────────────────────────────
+    try:
+        sweep = liquidity_sweep(df_1h, max_bars=config.SMC_SWEEP_MAX_BARS)
+        if sweep is not None:
+            if sweep.bull_sweep:
+                votes.append(IndicatorVote('smc_liquidity', +1, INDICATOR_WEIGHTS['smc_liquidity'],
+                    f'Bullish liquidity sweep (swept low at ${sweep.swept_level:,.0f}) — 1H'))
+            elif sweep.bear_sweep:
                 votes.append(IndicatorVote('smc_liquidity', -1, INDICATOR_WEIGHTS['smc_liquidity'],
-                    f'Bearish liquidity sweep — wicked above ${sweep_1h.swept_level:,.0f} '
-                    f'and rejected ({sweep_1h.bars_ago} bars ago, wick={sweep_1h.wick_pct:.2f}%)'))
+                    f'Bearish liquidity sweep (swept high at ${sweep.swept_level:,.0f}) — 1H'))
+            else:
+                votes.append(IndicatorVote('smc_liquidity', 0, INDICATOR_WEIGHTS['smc_liquidity'],
+                    'No liquidity sweep — 1H'))
+    except Exception as e:
+        logger.debug(f"Liquidity sweep error ({ticker}): {e}")
+
+    # Also run key indicators on 1D for higher-timeframe confluence
+    # ── 10–15. Daily timeframe repeats (order block, FVG, BOS) ─
+    if df_1d is not None and not df_1d.empty and len(df_1d) >= 20:
+        try:
+            ob_1d = order_block(df_1d,
+                                impulse_pct=config.SMC_OB_IMPULSE_PCT,
+                                proximity_pct=config.SMC_OB_PROXIMITY_PCT * 1.5)
+            if ob_1d is not None:
+                if ob_1d.bullish_ob and ob_1d.near_bullish:
+                    votes.append(IndicatorVote('smc_order_block', +1,
+                        INDICATOR_WEIGHTS['smc_order_block'] * 0.7,
+                        f'Bullish OB (1D) at ${ob_1d.bullish_level:,.0f}'))
+                elif ob_1d.bearish_ob and ob_1d.near_bearish:
+                    votes.append(IndicatorVote('smc_order_block', -1,
+                        INDICATOR_WEIGHTS['smc_order_block'] * 0.7,
+                        f'Bearish OB (1D) at ${ob_1d.bearish_level:,.0f}'))
+        except Exception as e:
+            logger.debug(f"1D OB error ({ticker}): {e}")
+
+    # ══════════════════════════════════════════════════════════
+    # ADVANCED TA LAYER (v3) — votes 16–22
+    # ══════════════════════════════════════════════════════════
+
+    # ── 16. AVWAP Pinch (Brian Shannon) — 1H ─────────────────
+    pinch_1h = None
+    try:
+        pinch_1h = avwap_pinch(df_1h, lookback=config.AVWAP_LOOKBACK) if not df_1h.empty else None
+        if pinch_1h:
+            if pinch_1h.breakout == 'bullish' and pinch_1h.slope_filter:
+                votes.append(IndicatorVote(
+                    'avwap_pinch', +1, INDICATOR_WEIGHTS['avwap_pinch'],
+                    f'AVWAP pinch bullish breakout (width={pinch_1h.width_pct:.1f}%) '
+                    f'— slope filter ✓ (avg buyer in profit)'
+                ))
+            elif pinch_1h.breakout == 'bullish' and not pinch_1h.slope_filter:
+                votes.append(IndicatorVote(
+                    'avwap_pinch', +1, INDICATOR_WEIGHTS['avwap_pinch'] * 0.5,
+                    f'AVWAP pinch bullish breakout but slope filter ✗ — reduced weight'
+                ))
+            elif pinch_1h.breakout == 'bearish':
+                votes.append(IndicatorVote(
+                    'avwap_pinch', -1, INDICATOR_WEIGHTS['avwap_pinch'],
+                    f'AVWAP pinch bearish breakout (width={pinch_1h.width_pct:.1f}%)'
+                ))
+            elif pinch_1h.pinch_active:
+                votes.append(IndicatorVote(
+                    'avwap_pinch', 0, INDICATOR_WEIGHTS['avwap_pinch'],
+                    f'AVWAP pinch ACTIVE (width={pinch_1h.width_pct:.1f}%) — no breakout yet'
+                ))
+            else:
+                votes.append(IndicatorVote(
+                    'avwap_pinch', 0, INDICATOR_WEIGHTS['avwap_pinch'],
+                    'No AVWAP pinch pattern'
+                ))
+    except Exception as e:
+        logger.debug(f"AVWAP pinch error ({ticker}): {e}")
+
+    # ── 17. Williams Alligator (Bill Williams) — 1H ──────────
+    gator_1h = None
+    try:
+        gator_1h = alligator(df_1h) if not df_1h.empty else None
+        if gator_1h:
+            if gator_1h.phase == 'sleeping':
+                votes.append(IndicatorVote(
+                    'williams_alligator', 0, INDICATOR_WEIGHTS['williams_alligator'],
+                    'Alligator SLEEPING — choppy market, no edge (hard HOLD)'
+                ))
+            elif gator_1h.phase == 'eating_bull':
+                votes.append(IndicatorVote(
+                    'williams_alligator', +1, INDICATOR_WEIGHTS['williams_alligator'],
+                    f'Alligator EATING BULL (lips={gator_1h.lips:.0f} > '
+                    f'teeth={gator_1h.teeth:.0f} > jaw={gator_1h.jaw:.0f})'
+                ))
+            elif gator_1h.phase == 'eating_bear':
+                votes.append(IndicatorVote(
+                    'williams_alligator', -1, INDICATOR_WEIGHTS['williams_alligator'],
+                    f'Alligator EATING BEAR (lips={gator_1h.lips:.0f} < '
+                    f'teeth={gator_1h.teeth:.0f} < jaw={gator_1h.jaw:.0f})'
+                ))
+            elif gator_1h.phase == 'awakening':
+                direction = +1 if gator_1h.lips_above_jaw else -1
+                votes.append(IndicatorVote(
+                    'williams_alligator', direction,
+                    INDICATOR_WEIGHTS['williams_alligator'] * 0.5,
+                    f'Alligator AWAKENING ({"bull" if direction > 0 else "bear"}) — half weight'
+                ))
+            else:  # sated
+                votes.append(IndicatorVote(
+                    'williams_alligator', 0, INDICATOR_WEIGHTS['williams_alligator'],
+                    'Alligator SATED — trend losing momentum'
+                ))
+    except Exception as e:
+        logger.debug(f"Alligator error ({ticker}): {e}")
+
+    # ── 18. Awesome Oscillator (Bill Williams) — 1H ──────────
+    try:
+        ao_1h = awesome_oscillator(df_1h) if not df_1h.empty else None
+        if ao_1h:
+            if ao_1h.signal == 'bullish_cross':
+                votes.append(IndicatorVote(
+                    'williams_ao', +1, INDICATOR_WEIGHTS['williams_ao'],
+                    f'AO zero-line cross BULLISH (val={ao_1h.value:+.4f})'
+                ))
+            elif ao_1h.signal == 'bearish_cross':
+                votes.append(IndicatorVote(
+                    'williams_ao', -1, INDICATOR_WEIGHTS['williams_ao'],
+                    f'AO zero-line cross BEARISH (val={ao_1h.value:+.4f})'
+                ))
+            elif ao_1h.signal == 'bullish':
+                votes.append(IndicatorVote(
+                    'williams_ao', +1, INDICATOR_WEIGHTS['williams_ao'] * 0.6,
+                    f'AO above zero and rising ({ao_1h.value:+.4f})'
+                ))
+            elif ao_1h.signal == 'bearish':
+                votes.append(IndicatorVote(
+                    'williams_ao', -1, INDICATOR_WEIGHTS['williams_ao'] * 0.6,
+                    f'AO below zero and falling ({ao_1h.value:+.4f})'
+                ))
+            else:
+                votes.append(IndicatorVote(
+                    'williams_ao', 0, INDICATOR_WEIGHTS['williams_ao'],
+                    f'AO neutral ({ao_1h.value:+.4f})'
+                ))
+    except Exception as e:
+        logger.debug(f"AO error ({ticker}): {e}")
+
+    # ── 19. Williams Fractals — 1H ────────────────────────────
+    try:
+        frac_1h = fractals(df_1h, lookback=60) if not df_1h.empty else None
+        if frac_1h:
+            if frac_1h.breakout_above_up and frac_1h.bars_since_up <= 10:
+                votes.append(IndicatorVote(
+                    'williams_fractals', +1, INDICATOR_WEIGHTS['williams_fractals'],
+                    f'Fractal breakout UP — broke ${frac_1h.last_up_fractal:,.0f} '
+                    f'({frac_1h.bars_since_up} bars ago)'
+                ))
+            elif frac_1h.breakout_below_dn and frac_1h.bars_since_down <= 10:
+                votes.append(IndicatorVote(
+                    'williams_fractals', -1, INDICATOR_WEIGHTS['williams_fractals'],
+                    f'Fractal breakdown DN — broke ${frac_1h.last_down_fractal:,.0f} '
+                    f'({frac_1h.bars_since_down} bars ago)'
+                ))
+            else:
+                votes.append(IndicatorVote(
+                    'williams_fractals', 0, INDICATOR_WEIGHTS['williams_fractals'],
+                    'No recent fractal breakout'
+                ))
+    except Exception as e:
+        logger.debug(f"Fractals error ({ticker}): {e}")
+
+    # ── 20. Relative Volume / "In Play" Filter (Bellafiore) — 1H ─
+    try:
+        rvol_1h = volume_relative(df_1h, lookback=20,
+                                  threshold=config.RVOL_MIN_THRESHOLD) if not df_1h.empty else None
+        if rvol_1h:
+            if rvol_1h.is_in_play:
+                last_open_v  = float(df_1h['open'].iloc[-1])
+                last_close_v = float(df_1h['close'].iloc[-1])
+                if last_close_v > last_open_v * 1.001:
+                    votes.append(IndicatorVote(
+                        'rvol_filter', +1, INDICATOR_WEIGHTS['rvol_filter'],
+                        f'RVOL {rvol_1h.rvol:.1f}x — IN PLAY (bull candle, smart money present)'
+                    ))
+                elif last_close_v < last_open_v * 0.999:
+                    votes.append(IndicatorVote(
+                        'rvol_filter', -1, INDICATOR_WEIGHTS['rvol_filter'],
+                        f'RVOL {rvol_1h.rvol:.1f}x — IN PLAY (bear candle, smart money present)'
+                    ))
+                else:
+                    votes.append(IndicatorVote(
+                        'rvol_filter', 0, INDICATOR_WEIGHTS['rvol_filter'],
+                        f'RVOL {rvol_1h.rvol:.1f}x — in play but neutral candle'
+                    ))
+            else:
+                votes.append(IndicatorVote(
+                    'rvol_filter', 0, INDICATOR_WEIGHTS['rvol_filter'],
+                    f'RVOL {rvol_1h.rvol:.1f}x — NOT in play (< {config.RVOL_MIN_THRESHOLD}x avg)'
+                ))
+    except Exception as e:
+        logger.debug(f"RVOL error ({ticker}): {e}")
+
+    # ── 21. Trap Detector (Schwager) — 1H ────────────────────
+    trap_1h = None
+    try:
+        trap_1h = trap_detector(df_1h, lookback=30,
+                                min_breakout_pct=0.3,
+                                max_trap_bars=config.TRAP_MAX_BARS) if not df_1h.empty else None
+        if trap_1h and trap_1h.trap_type is not None:
+            if trap_1h.trap_type == 'bull_trap' and trap_1h.bars_ago <= config.TRAP_MAX_BARS:
+                votes.append(IndicatorVote(
+                    'trap_detector', -1, INDICATOR_WEIGHTS['trap_detector'],
+                    f'BULL TRAP detected at ${trap_1h.trap_level:,.0f} '
+                    f'({trap_1h.bars_ago} bars ago, reversal={trap_1h.reversal_pct:.1f}%) '
+                    f'— FLIP TO SELL'
+                ))
+            elif trap_1h.trap_type == 'bear_trap' and trap_1h.bars_ago <= config.TRAP_MAX_BARS:
+                votes.append(IndicatorVote(
+                    'trap_detector', +1, INDICATOR_WEIGHTS['trap_detector'],
+                    f'BEAR TRAP detected at ${trap_1h.trap_level:,.0f} '
+                    f'({trap_1h.bars_ago} bars ago, reversal={trap_1h.reversal_pct:.1f}%) '
+                    f'— FLIP TO BUY'
+                ))
+            else:
+                votes.append(IndicatorVote(
+                    'trap_detector', 0, INDICATOR_WEIGHTS['trap_detector'],
+                    f'Trap detected but stale ({trap_1h.bars_ago} bars ago)'
+                ))
         else:
-            votes.append(IndicatorVote('smc_liquidity', 0, INDICATOR_WEIGHTS['smc_liquidity'],
-                f'Liquidity sweep {sweep_1h.bars_ago} bars ago — too old to act on'))
-    else:
-        votes.append(IndicatorVote('smc_liquidity', 0, INDICATOR_WEIGHTS['smc_liquidity'],
-            'No recent liquidity sweep'))
+            votes.append(IndicatorVote(
+                'trap_detector', 0, INDICATOR_WEIGHTS['trap_detector'],
+                'No trap pattern detected'
+            ))
+    except Exception as e:
+        logger.debug(f"Trap detector error ({ticker}): {e}")
 
-    # ── Aggregate ─────────────────────────────────────────────
-    weighted_bull = sum(v.vote * v.weight for v in votes if v.vote > 0)
-    weighted_bear = sum(abs(v.vote) * v.weight for v in votes if v.vote < 0)
-    total_w       = sum(v.weight for v in votes) or 1.0
+    # ── 22. Elliott Wave Divergence — 1H ─────────────────────
+    ew_1h = None
+    try:
+        ew_1h = elliott_divergence(df_1h, lookback=config.ELLIOTT_LOOKBACK) if not df_1h.empty else None
+        if ew_1h:
+            if ew_1h.wave_context == 'wave3_likely':
+                votes.append(IndicatorVote(
+                    'elliott_divergence', +1, INDICATOR_WEIGHTS['elliott_divergence'],
+                    f'Elliott Wave 3 likely — RSI confirming price high '
+                    f'(rsi={ew_1h.rsi_at_high:.1f} at ${ew_1h.price_high:,.0f})'
+                ))
+            elif ew_1h.wave_context == 'wave5_warning':
+                votes.append(IndicatorVote(
+                    'elliott_divergence', 0, INDICATOR_WEIGHTS['elliott_divergence'],
+                    f'Elliott Wave 5 WARNING — price high but RSI diverging '
+                    f'(rsi={ew_1h.rsi_at_high:.1f}) — reduce position size'
+                ))
+            elif ew_1h.wave_context == 'wave_a_likely':
+                votes.append(IndicatorVote(
+                    'elliott_divergence', +1, INDICATOR_WEIGHTS['elliott_divergence'] * 0.7,
+                    f'Elliott Wave A — buyers absorbing selling pressure '
+                    f'(rsi divergence at ${ew_1h.price_high:,.0f})'
+                ))
+            else:
+                votes.append(IndicatorVote(
+                    'elliott_divergence', 0, INDICATOR_WEIGHTS['elliott_divergence'],
+                    'No Elliott divergence pattern'
+                ))
+    except Exception as e:
+        logger.debug(f"Elliott divergence error ({ticker}): {e}")
 
-    bull_score = weighted_bull / total_w
-    bear_score = weighted_bear / total_w
-    net_score  = (weighted_bull - weighted_bear) / total_w
+    # ══════════════════════════════════════════════════════════
+    # AGGREGATE
+    # ══════════════════════════════════════════════════════════
 
-    atr_res = atr(df_1h) if not df_1h.empty else None
-    atr_pct = atr_res.pct if atr_res else 2.0
+    bull_score, bear_score, net_score = _aggregate(votes)
 
-    trend_dir = ts_1d.direction if ts_1d else 'ranging'
+    # Build a compact summary string
+    bull_votes = [v for v in votes if v.vote == +1]
+    bear_votes = [v for v in votes if v.vote == -1]
+    summary_parts = []
+    if bull_votes:
+        summary_parts.append('Bull: ' + '; '.join(v.name for v in bull_votes[:3]))
+    if bear_votes:
+        summary_parts.append('Bear: ' + '; '.join(v.name for v in bear_votes[:3]))
+    summary = ' | '.join(summary_parts) or 'No directional signals'
 
-    # Top 5 non-neutral reasons for the summary
-    summary_votes = sorted([v for v in votes if v.vote != 0],
-                            key=lambda x: x.weight, reverse=True)
-    summary = ' | '.join(v.reason for v in summary_votes[:5])
+    # ── v3 flags ─────────────────────────────────────────────
+    alligator_sleeping = (gator_1h is not None and gator_1h.phase == 'sleeping')
+    wave5_warning      = (ew_1h is not None and ew_1h.wave_context == 'wave5_warning')
+    trap_active        = (
+        trap_1h is not None and
+        trap_1h.trap_type is not None and
+        trap_1h.bars_ago <= config.TRAP_MAX_BARS
+    )
+    trap_sig           = (trap_1h.signal if trap_active and trap_1h else 'none')
 
-    logger.info(
-        f"{ticker} @ ${price:,.2f} | net={net_score:+.3f} "
-        f"bull={bull_score:.2f} bear={bear_score:.2f} "
-        f"atr={atr_pct:.1f}% trend={trend_dir}"
+    logger.debug(
+        f"Analysis {ticker}: trend={trend} bull={bull_score:.0%} "
+        f"bear={bear_score:.0%} net={net_score:+.3f} votes={len(votes)}"
     )
 
     return AnalysisResult(
         ticker=ticker,
-        price=price,
+        trend=trend,
         bull_score=bull_score,
         bear_score=bear_score,
         net_score=net_score,
         votes=votes,
-        atr_pct=atr_pct,
-        nearest_support=nearest_support,
-        nearest_resistance=nearest_resistance,
-        trend=trend_dir,
         summary=summary,
+        alligator_sleeping=alligator_sleeping,
+        wave5_warning=wave5_warning,
+        trap_active=trap_active,
+        trap_signal=trap_sig,
     )
