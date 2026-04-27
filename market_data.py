@@ -91,7 +91,7 @@ def fetch_multi_timeframe(ticker: str) -> dict[str, pd.DataFrame]:
 
     tasks = {
         '1m': (TimeFrame.Minute, 100),
-        '1h': (TimeFrame.Hour,   200),
+        '1h': (TimeFrame.Hour,   300),
         '1d': (TimeFrame.Day,    200),
     }
     results: dict[str, pd.DataFrame] = {}

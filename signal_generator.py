@@ -17,6 +17,7 @@
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 from loguru import logger
+from datetime import datetime, timezone
 import config
 from market_analyzer import analyze, AnalysisResult
 
@@ -38,6 +39,61 @@ class Signal:
 
 
 _EPSILON = 0.001
+
+
+def _in_kill_zone() -> tuple[bool, str]:
+    """
+    Check if current UTC time falls within an institutional Kill Zone.
+
+    Returns (is_in_zone: bool, zone_label: str).
+    'off_hours' label is returned when outside all zones.
+
+    Kill Zones defined in config.KILL_ZONES as (label, start_h, end_h) UTC.
+    """
+    if not config.KILL_ZONES_ENABLED:
+        return True, 'disabled'
+    now_utc = datetime.now(timezone.utc)
+    hour    = now_utc.hour
+    for label, start, end in config.KILL_ZONES:
+        if start <= hour < end:
+            return True, label
+    return False, 'off_hours'
+
+
+def _mtf_is_counter_trend(analysis: AnalysisResult, action: str) -> bool:
+    """
+    True if the 1D trend directly contradicts the proposed action.
+
+    BUY on a 1D downtrend = counter-trend → penalise.
+    SELL on a 1D uptrend  = counter-trend → penalise.
+    """
+    daily = getattr(analysis, 'daily_trend', 'sideways')
+    if action == 'BUY'  and daily == 'downtrend':
+        return True
+    if action == 'SELL' and daily == 'uptrend':
+        return True
+    return False
+
+
+def _mtf_daily_aligns(analysis: AnalysisResult, action: str) -> bool:
+    """True when 1D trend fully confirms the proposed action."""
+    daily = getattr(analysis, 'daily_trend', 'sideways')
+    if action == 'BUY'  and daily == 'uptrend':
+        return True
+    if action == 'SELL' and daily == 'downtrend':
+        return True
+    return False
+
+
+def _btc_anchor_blocks_buy(analysis: AnalysisResult, ticker: str) -> bool:
+    """
+    Intermarket Anchor: return True if BTC is bearish AND this is an altcoin BUY.
+    BTC itself is never blocked by its own anchor.
+    """
+    if ticker == 'BTCUSD':
+        return False
+    btc_bullish = getattr(analysis, 'btc_anchor_bullish', True)
+    return not btc_bullish
 
 
 def _has_vote(analysis: AnalysisResult, name: str) -> bool:
@@ -101,7 +157,21 @@ def _trap_contradicts(analysis: AnalysisResult, action: str) -> bool:
 
 
 def _avwap_slope_filter_failed(analysis: AnalysisResult) -> bool:
-    """True if the AVWAP breakout occurred but the slope filter was NOT met."""
+    """
+    True if the AVWAP breakout occurred but the slope filter was NOT met.
+
+    v5: use the structured `avwap_slope_ok` field on AnalysisResult instead
+    of string-matching the vote reason. The previous version matched a
+    Unicode '✗' literal which was fragile to format changes and encoding
+    issues.
+    """
+    if hasattr(analysis, 'avwap_slope_ok'):
+        # If the field is False AND the avwap_pinch vote is bullish (the only
+        # case the slope filter applies to), the slope filter failed.
+        return (not analysis.avwap_slope_ok) and \
+               (_get_vote(analysis, 'avwap_pinch') == +1)
+    # Legacy fallback (kept for backward compat in case AnalysisResult is
+    # built from older code paths).
     reason = _get_reason(analysis, 'avwap_pinch')
     return 'slope filter ✗' in reason
 
@@ -134,6 +204,22 @@ def generate_signal(ticker: str) -> Signal:
     Run multi-timeframe TA + SMC + Advanced TA analysis and produce a
     BUY / SELL / HOLD signal with confidence score.
     """
+    # ── v5: loss-streak cooldown ──────────────────────────────
+    # Check before doing the (expensive) analysis. If this ticker is on
+    # ice from consecutive losses, return HOLD immediately. SELLs and
+    # pyramid signals are not affected here because cooldown is enforced
+    # again in executor.execute_signal — this early-out is just a
+    # performance optimisation.
+    try:
+        from executor import is_in_cooldown
+        if is_in_cooldown(ticker):
+            return Signal(
+                ticker, 'HOLD', 0.0, 0.0, 0.0, 0.0, 0,
+                f'[COOLDOWN] {ticker} frozen — recent loss streak'
+            )
+    except Exception:
+        pass  # don't let cooldown errors block analysis
+
     analysis = analyze(ticker)
 
     if analysis is None:
@@ -165,12 +251,34 @@ def generate_signal(ticker: str) -> Signal:
             ticker, 'HOLD', 0.0, net, bull, bear, n_votes, hold_reason
         )
 
+    buy_threshold = config.CRYPTO_BUY_THRESHOLD
+    sell_threshold = config.CRYPTO_SELL_THRESHOLD
+    min_net = config.CRYPTO_MIN_AVG_SCORE
+
+    # ── v4: BTC ANCHOR FILTER ─────────────────────────────────
+    # If Bitcoin is in a confirmed downtrend, altcoin BUY signals are
+    # statistically far less reliable — the ocean is draining all boats.
+    # Allow SELL signals (and BTC itself) through unconditionally.
+    if bull >= buy_threshold - _EPSILON and _btc_anchor_blocks_buy(analysis, ticker):
+        btc_hold = f'[BTC ANCHOR] BTC in downtrend — altcoin BUY suppressed. {reason}'
+        logger.info(f"HOLD {ticker}: {btc_hold}")
+        return Signal(
+            ticker, 'HOLD', 0.0, net, bull, bear, n_votes, btc_hold
+        )
+
+    # ── v4: KILL ZONE TIMING FILTER ───────────────────────────
+    # Smart money is most active at session overlaps. Signals generated
+    # outside these windows get a confidence penalty — not a full veto —
+    # because crypto can move violently any hour, but institutional intent
+    # is statistically concentrated in the zones.
+    in_zone, zone_label = _in_kill_zone()
+    kill_zone_penalty   = 1.0
+    if not in_zone:
+        kill_zone_penalty = config.KILL_ZONE_OFF_HOURS_PENALTY
+        logger.debug(f"{ticker}: outside kill zones (hour={datetime.now(timezone.utc).hour} UTC) — applying {kill_zone_penalty:.0%} confidence penalty")
+
     # ── Bear market override ───────────────────────────────────
     in_bear_market = analysis.trend == 'downtrend'
-
-    buy_threshold  = config.CRYPTO_BUY_THRESHOLD
-    sell_threshold = config.CRYPTO_SELL_THRESHOLD
-    min_net        = config.CRYPTO_MIN_AVG_SCORE
 
     if in_bear_market:
         buy_threshold = min(0.55, buy_threshold + 0.20)
@@ -208,6 +316,22 @@ def generate_signal(ticker: str) -> Signal:
                 f'[TRAP FLIP] Bull trap detected — {trap_reason} | was BUY',
                 trap_flip=True,
             )
+
+        # v4: MTF Daily Alignment — Triple Screen
+        if _mtf_is_counter_trend(analysis, 'BUY'):
+            confidence *= config.MTF_COUNTER_TREND_PENALTY
+            reason += f' | ⚠ MTF COUNTER-TREND: 1D={analysis.daily_trend} vs 1H BUY (reduced)'
+            logger.warning(f"{ticker}: counter-trend BUY (1D={analysis.daily_trend}) — confidence penalised to {confidence:.0%}")
+        elif _mtf_daily_aligns(analysis, 'BUY'):
+            confidence = min(1.0, confidence * 1.12)
+            reason += f' | MTF aligned: 1D uptrend ✓'
+
+        # v4: Kill zone timing
+        if kill_zone_penalty < 1.0:
+            confidence *= kill_zone_penalty
+            reason += f' | off-hours penalty ({zone_label})'
+        else:
+            reason += f' | kill zone: {zone_label}'
 
         # CHoCH bullish reversal boost
         if choch_bullish:
@@ -267,6 +391,20 @@ def generate_signal(ticker: str) -> Signal:
         # v3: Pyramiding flag — should we add to an existing winner?
         pyramid = _should_pyramid(analysis) and not wave5_caution and not in_bear_market
 
+        # v5: Confidence floor. After all stacking penalties (counter-trend ×
+        # kill-zone × wave5 × bear × slope), confidence can drop into single
+        # digits. Below CONFIDENCE_FLOOR, the signal is just clutter — emit
+        # HOLD instead of placing a token-size order that burns daily quota.
+        if confidence < config.CONFIDENCE_FLOOR:
+            logger.info(
+                f"HOLD {ticker}: BUY confidence {confidence:.0%} < floor "
+                f"{config.CONFIDENCE_FLOOR:.0%} — too weak after penalties"
+            )
+            return Signal(
+                ticker, 'HOLD', 0.0, net, bull, bear, n_votes,
+                f'[CONF FLOOR] would-be BUY but conf {confidence:.0%} < {config.CONFIDENCE_FLOOR:.0%} | {reason}'
+            )
+
         logger.success(
             f"BUY signal: {ticker} | bull={bull:.0%} net={net:+.3f} "
             f"conf={confidence:.0%} pyramid={pyramid} | {reason}"
@@ -288,12 +426,27 @@ def generate_signal(ticker: str) -> Signal:
             logger.warning(
                 f"TRAP FLIP {ticker}: SELL signal overridden by bear trap → BUY | {trap_reason}"
             )
-            confidence = min(1.0, max(0.4, net * 2.5 * 1.2))
+            confidence = min(1.0, max(0.4, abs(net) * 2.5 * 1.2))
             return Signal(
                 ticker, 'BUY', confidence, net, bull, bear, n_votes,
                 f'[TRAP FLIP] Bear trap detected — {trap_reason} | was SELL',
                 trap_flip=True,
             )
+
+        # v4: MTF Daily Alignment
+        if _mtf_is_counter_trend(analysis, 'SELL'):
+            confidence *= config.MTF_COUNTER_TREND_PENALTY
+            reason += f' | ⚠ MTF COUNTER-TREND: 1D={analysis.daily_trend} vs 1H SELL (reduced)'
+        elif _mtf_daily_aligns(analysis, 'SELL'):
+            confidence = min(1.0, confidence * 1.12)
+            reason += f' | MTF aligned: 1D downtrend ✓'
+
+        # v4: Kill zone timing
+        if kill_zone_penalty < 1.0:
+            confidence *= kill_zone_penalty
+            reason += f' | off-hours penalty ({zone_label})'
+        else:
+            reason += f' | kill zone: {zone_label}'
 
         if choch_bearish:
             confidence = min(1.0, confidence * 1.20)
@@ -321,6 +474,17 @@ def generate_signal(ticker: str) -> Signal:
         if _get_vote(analysis, 'avwap_pinch') == -1:
             confidence = min(1.0, confidence * 1.08)
             reason += ' | AVWAP pinch bearish breakout'
+
+        # v5: Confidence floor for SELLs (symmetric with BUY).
+        if confidence < config.CONFIDENCE_FLOOR:
+            logger.info(
+                f"HOLD {ticker}: SELL confidence {confidence:.0%} < floor "
+                f"{config.CONFIDENCE_FLOOR:.0%} — too weak after penalties"
+            )
+            return Signal(
+                ticker, 'HOLD', 0.0, net, bull, bear, n_votes,
+                f'[CONF FLOOR] would-be SELL but conf {confidence:.0%} < {config.CONFIDENCE_FLOOR:.0%} | {reason}'
+            )
 
         logger.success(
             f"SELL signal: {ticker} | bear={bear:.0%} net={net:+.3f} "

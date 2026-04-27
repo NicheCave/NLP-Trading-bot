@@ -39,12 +39,12 @@ if not WATCHLIST:
 # ── Signal Thresholds ─────────────────────────────────────────
 CRYPTO_BUY_THRESHOLD  = 0.35
 CRYPTO_SELL_THRESHOLD = 0.35
-CRYPTO_MIN_AVG_SCORE  = 0.15
+CRYPTO_MIN_AVG_SCORE  = 0.22   # raised from 0.15 — kills marginal-edge signals (v5)
 
 # ── Risk Management ───────────────────────────────────────────
 CRYPTO_RISK_PER_TRADE  = 0.01   # 1% of portfolio per trade
 CRYPTO_STOP_LOSS_PCT   = 0.05   # 5% stop-loss
-CRYPTO_TAKE_PROFIT_PCT = 0.10   # 10% take-profit
+CRYPTO_TAKE_PROFIT_PCT = 0.15   # 15% take-profit — asymmetric 3:1 R:R (was 0.10) (v5)
 
 USE_ATR_STOP        = True
 ATR_STOP_MULTIPLIER = 1.5
@@ -114,6 +114,81 @@ TRAP_MAX_BARS = 5
 # Number of 1H bars to scan for swing highs/lows when detecting
 # RSI divergence (Wave 3 / Wave 5 identification).
 ELLIOTT_LOOKBACK = 50
+
+# ── v4: Institutional "Kill Zones" ────────────────────────────
+# Smart money (institutional) volume concentrates at session overlaps.
+# Signals outside these windows are more likely retail noise.
+# All times are UTC.  Set KILL_ZONES_ENABLED=False to disable.
+KILL_ZONES_ENABLED = True
+
+KILL_ZONES = [
+    # (label,        start_hour_utc, end_hour_utc)
+    # IMPORTANT: Overlap MUST come before NY because (13–15) ⊂ (13–16).
+    # The matcher returns the first hit, so Overlap has to be tested first
+    # or it'd be shadowed by NY and never reported. (v5 fix)
+    ('Overlap',     13,  15),   # London–NY overlap — THE highest-probability window
+    ('London',       8,  11),   # London open — strong EUR/GBP/BTC correlation
+    ('NY',          13,  16),   # New York open — highest USD-denominated volume
+    ('Asia',         0,   3),   # Tokyo/Singapore open — BTC/ETH deepest Asian vol
+]
+
+# Confidence penalty (multiplier) applied to signals generated OUTSIDE kill zones.
+# 0.80 = 20% confidence haircut for "off-hours" entries.
+KILL_ZONE_OFF_HOURS_PENALTY = 0.80
+
+# ── v4: MTF Daily Alignment ───────────────────────────────────
+# If 1D trend opposes the 1H signal direction, apply this confidence penalty.
+# 0.70 = 30% haircut for counter-trend trades (still allows them but shrinks size).
+MTF_COUNTER_TREND_PENALTY  = 0.70
+
+# Minimum daily_trend requirement for a BUY to get full size.
+# 'uptrend'  → only buy when 1D is also bullish
+# 'sideways' → allow buys in sideways + uptrend (less strict)
+MTF_BUY_MIN_DAILY_TREND = 'sideways'   # set to 'uptrend' for strictest mode
+
+# ── v4: Time-Based Stops ──────────────────────────────────────
+# If a position hasn't hit TP or SL after this many hours, exit at market.
+# Steenbarger/Bellafiore: time is risk. Zombie trades occupy capital.
+TIME_STOP_HOURS = 12
+
+# ── v4: ATR Trailing Stop ─────────────────────────────────────
+# Multiplier for the ATR-based trailing stop.
+# 2.0 × ATR  keeps stop wide enough to breathe but still locks in profits.
+TRAILING_ATR_MULTIPLIER = 2.0
+
+# ─────────────────────────────────────────────────────────────
+# v5: NEW EDGE CONSTANTS + BUG-FIX KNOBS
+# ─────────────────────────────────────────────────────────────
+
+# ── v5: Confidence floor (signal_generator) ───────────────────
+# After all stacking penalties (counter-trend × kill-zone × wave5 × bear),
+# confidence can compound down to single digits. Below this threshold the
+# signal is downgraded to HOLD instead of placing a tiny token order.
+# 0.25 = 25% — anything weaker is just clutter and burns daily-trade quota.
+CONFIDENCE_FLOOR = 0.25
+
+# ── v5: Loss-streak cooldown ──────────────────────────────────
+# After this many consecutive losses on the same ticker, freeze new BUYs
+# on that ticker for COOLDOWN_HOURS. Steenbarger "tilt insurance":
+# losing streaks correlate with regime changes the model hasn't adapted to.
+LOSS_STREAK_THRESHOLD     = 2
+LOSS_STREAK_COOLDOWN_HRS  = 6
+
+# ── v5: Volume-confirmed BOS / CHoCH ──────────────────────────
+# A structural break on average volume is much weaker than one on RVOL ≥ 1.5.
+# When RVOL meets this threshold during a BOS/CHoCH, the smc_bos_choch vote
+# weight is multiplied by BOOST. When RVOL is anaemic, the vote is REDUCED.
+BOS_VOLUME_RVOL_MIN  = 1.5
+BOS_VOLUME_BOOST     = 1.30   # weight × 1.30 when volume confirms
+BOS_VOLUME_PENALTY   = 0.60   # weight × 0.60 when volume is weak
+
+# ── v5: Pyramiding storm guard ────────────────────────────────
+# Minimum interval (in seconds) between two scale-ins on the same ticker.
+# Without this, scale_in_winner would fire every EXECUTION_INTERVAL while
+# the cached signal still says add_to_winner=True — turning a 50% pyramid
+# into a 600% one inside a single 4-minute analysis cycle.
+# Default = one full analysis cycle worth of seconds.
+PYRAMID_MIN_INTERVAL_SEC = CHECK_INTERVAL * 60   # 240 s by default
 
 # ── Helper functions ──────────────────────────────────────────
 def is_crypto(ticker: str) -> bool:

@@ -53,11 +53,11 @@ class TradeRecord:
     action: str
     confidence: float
     entry_price: float
-    signal_tags: list[str]    # which features were active (e.g. 'CHoCH', 'AVWAP', 'trap_flip')
+    signal_tags: list[str]  # which features were active (e.g. 'CHoCH', 'AVWAP', 'trap_flip')
     wave5_caution: bool
     trap_flip: bool
     timestamp: str
-    outcome: Optional[str] = None   # 'win' | 'loss' | None (open)
+    outcome: Optional[str] = None  # 'win' | 'loss' | None (open)
     pnl_pct: Optional[float] = None
 
 
@@ -77,7 +77,7 @@ class EdgeTracker:
     EDGE_LOG_PATH = "logs/edge_log.json"
 
     def __init__(self):
-        self.open_trades: dict[str, TradeRecord] = {}   # ticker → open record
+        self.open_trades: dict[str, TradeRecord] = {}  # ticker → open record
         self.closed_trades: list[TradeRecord] = []
         self._load()
 
@@ -109,27 +109,30 @@ class EdgeTracker:
         reason = signal.reason.lower()
 
         # SMC tags
-        if 'choch'        in reason: tags.append('CHoCH')
+        if 'choch' in reason: tags.append('CHoCH')
         if 'liquidity sweep' in reason: tags.append('sweep')
-        if 'order block'  in reason: tags.append('OB')
-        if 'fvg'          in reason or 'fair value' in reason: tags.append('FVG')
-        if 'bos'          in reason: tags.append('BOS')
+        if 'order block' in reason: tags.append('OB')
+        if 'fvg' in reason or 'fair value' in reason: tags.append('FVG')
+        if 'bos' in reason: tags.append('BOS')
 
         # v3 advanced tags
-        if 'avwap'        in reason: tags.append('AVWAP')
-        if 'alligator'    in reason: tags.append('Alligator')
+        if 'avwap' in reason: tags.append('AVWAP')
+        if 'alligator' in reason: tags.append('Alligator')
         if 'ao zero-line' in reason: tags.append('AO_cross')
-        if 'fractal'      in reason: tags.append('Fractal')
-        if 'trap flip'    in reason or signal.trap_flip: tags.append('TrapFlip')
-        if 'wave 5'       in reason or signal.wave5_caution: tags.append('W5_caution')
-        if 'wave 3'       in reason: tags.append('W3_confirmed')
-        if 'smc signals'  in reason: tags.append('multi_SMC')
-        if 'bear market'  in reason: tags.append('bear_ctx')
+        if 'fractal' in reason: tags.append('Fractal')
+        if 'trap flip' in reason or signal.trap_flip: tags.append('TrapFlip')
+        if 'wave 5' in reason or signal.wave5_caution: tags.append('W5_caution')
+        if 'wave 3' in reason: tags.append('W3_confirmed')
+        if 'smc signals' in reason: tags.append('multi_SMC')
+        if 'bear market' in reason: tags.append('bear_ctx')
 
         # Confidence buckets
-        if signal.confidence >= 0.8:   tags.append('conf_high')
-        elif signal.confidence >= 0.5: tags.append('conf_mid')
-        else:                          tags.append('conf_low')
+        if signal.confidence >= 0.8:
+            tags.append('conf_high')
+        elif signal.confidence >= 0.5:
+            tags.append('conf_mid')
+        else:
+            tags.append('conf_low')
 
         return tags
 
@@ -159,11 +162,18 @@ class EdgeTracker:
         if record.action == 'SELL':
             pnl_pct = -pnl_pct  # short trade
 
-        record.outcome  = 'win' if pnl_pct > 0 else 'loss'
-        record.pnl_pct  = round(pnl_pct, 3)
+        record.outcome = 'win' if pnl_pct > 0 else 'loss'
+        record.pnl_pct = round(pnl_pct, 3)
 
         self.closed_trades.append(record)
         self._save()
+
+        # v5: notify executor so it can update loss-streak / cooldown state
+        try:
+            from executor import register_trade_outcome
+            register_trade_outcome(ticker, record.outcome)
+        except Exception as e:
+            logger.debug(f"register_trade_outcome failed: {e}")
 
         emoji = '✅' if record.outcome == 'win' else '❌'
         logger.info(
@@ -182,7 +192,7 @@ class EdgeTracker:
 
         # Build tag → [win, total] map
         tag_stats: dict[str, list[int]] = {}
-        total_wins   = 0
+        total_wins = 0
         total_trades = len(self.closed_trades)
 
         for t in self.closed_trades:
@@ -198,10 +208,10 @@ class EdgeTracker:
         overall_wr = total_wins / total_trades * 100 if total_trades > 0 else 0
 
         # Average confidence calibration
-        conf_wins  = [t.confidence for t in self.closed_trades if t.outcome == 'win']
-        conf_loss  = [t.confidence for t in self.closed_trades if t.outcome == 'loss']
-        avg_conf_w = sum(conf_wins)  / len(conf_wins)  * 100 if conf_wins  else 0
-        avg_conf_l = sum(conf_loss)  / len(conf_loss)  * 100 if conf_loss  else 0
+        conf_wins = [t.confidence for t in self.closed_trades if t.outcome == 'win']
+        conf_loss = [t.confidence for t in self.closed_trades if t.outcome == 'loss']
+        avg_conf_w = sum(conf_wins) / len(conf_wins) * 100 if conf_wins else 0
+        avg_conf_l = sum(conf_loss) / len(conf_loss) * 100 if conf_loss else 0
 
         lines = [
             f"",
@@ -250,13 +260,16 @@ class EdgeTracker:
                     from executor import _get_current_price
                     from config import to_order_symbol
                     order_sym = to_order_symbol(ticker)
-                    
+
                     exit_price = _get_current_price(ticker, order_sym)
                     if exit_price is None:
                         exit_price = self.open_trades[ticker].entry_price
-                    
+
                     logger.info(f"EdgeTracker: External exit detected for {ticker} — sync complete.")
                     self.record_exit(ticker, exit_price, 'auto_exit')
+
+                    from executor import clear_tracking_state
+                    clear_tracking_state(ticker)
         except Exception as e:
             logger.warning(f"EdgeTracker sync error: {e}")
 
@@ -270,27 +283,38 @@ edge_tracker = EdgeTracker()
 def execute_signal_tracked(signal: Signal):
     """
     Wrapper around execute_signal that records entries in the EdgeTracker.
-    FIX: Only records if the trade isn't skipped by the 'already_in_position' guard.
+
+    v5 FIX (CRITICAL): The previous guard blocked ALL BUY signals when a
+    position already existed — including pyramid signals. That made the
+    Bellafiore scale-in feature dead code. The guard now only blocks NEW
+    entries (signal.add_to_winner=False); pyramid signals pass through to
+    execute_signal which routes them to scale_in_winner().
     """
     if signal.action == 'HOLD':
         return
 
-    # GUARD: If we already have this position, don't record a new entry in the tracker
+    # GUARD: If already in position AND this isn't a pyramid signal, skip.
+    # Pyramid signals fall through to execute_signal → scale_in_winner.
     from executor import already_in_position
-    if signal.action == 'BUY' and already_in_position(signal.ticker):
+    if (signal.action == 'BUY'
+            and already_in_position(signal.ticker)
+            and not signal.add_to_winner):
         return
 
-    # Capture price for the record
+    # Capture price for the EdgeTracker entry record (only for fresh entries)
     from config import to_order_symbol
     from executor import _get_current_price
     order_sym = to_order_symbol(signal.ticker)
     price = _get_current_price(signal.ticker, order_sym)
-    
+
     # Place the actual order on Alpaca
     execute_signal(signal)
-    
-    if signal.action == 'BUY' and price is not None:
+
+    # Only record a NEW entry in EdgeTracker when this was a fresh BUY,
+    # not a pyramid scale-in (those don't open a new tracked trade).
+    if signal.action == 'BUY' and price is not None and not signal.add_to_winner:
         edge_tracker.record_entry(signal, price)
+
 
 # ══════════════════════════════════════════════════════════════
 # SCHEDULE LOOPS
@@ -391,7 +415,7 @@ schedule.every(config.EXIT_INTERVAL).seconds.do(exit_cycle)
 schedule.every(config.DAILY_SYNC_INTERVAL).seconds.do(sync_cycle)
 schedule.every(config.EDGE_LOG_INTERVAL).minutes.do(edge_cycle)
 
-logger.info("🤖 Crypto TA + SMC + Advanced TA Bot starting (v3)...")
+logger.info("🤖 Crypto TA + SMC + Advanced TA Bot starting (v5)...")
 logger.info(f"   Device:        {config.DEVICE}")
 logger.info(f"   Watchlist:     {config.WATCHLIST}")
 logger.info(f"   Analysis:      every {config.CHECK_INTERVAL} min  (TA + SMC + AdvTA)")
@@ -400,9 +424,14 @@ logger.info(f"   Exit guard:    every {config.EXIT_INTERVAL} s")
 logger.info(f"   Counter sync:  every {config.DAILY_SYNC_INTERVAL} s")
 logger.info(f"   Edge report:   every {config.EDGE_LOG_INTERVAL} min")
 logger.info(f"   Alpaca:        {config.ALPACA_BASE_URL}")
-logger.info(f"   New features:  AVWAP pinch | Alligator veto | AO | Fractals")
+logger.info(f"   v3 features:   AVWAP pinch | Alligator veto | AO | Fractals")
 logger.info(f"                  RVOL filter | Trap flip | Elliott W5 caution")
 logger.info(f"                  Bellafiore pyramiding | Steenbarger edge log")
+logger.info(f"   v4 features:   Kill zones | MTF align | BTC anchor | Time/Trail stops")
+logger.info(f"   v5 features:   Pyramid storm guard | Persisted exits | Vol-confirmed BOS")
+logger.info(
+    f"                  Confidence floor ({config.CONFIDENCE_FLOOR:.0%}) | Loss-streak cooldown ({config.LOSS_STREAK_THRESHOLD}L → {config.LOSS_STREAK_COOLDOWN_HRS}h)")
+logger.info(f"                  Asymmetric R:R ({config.CRYPTO_STOP_LOSS_PCT:.0%}/{config.CRYPTO_TAKE_PROFIT_PCT:.0%})")
 
 # Run immediately to populate cache
 analysis_cycle()

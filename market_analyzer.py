@@ -79,6 +79,15 @@ class AnalysisResult:
     trap_active:        bool = False   # True → trap pattern present → flip signal
     trap_signal:        str  = 'none'  # 'buy' | 'sell' | 'none'
 
+    # ── v4 flags ──────────────────────────────────────────────
+    btc_anchor_bullish: bool = True    # False → BTC bearish → block altcoin BUYs
+    daily_trend:        str  = 'sideways'  # 1D trend for MTF veto
+    hourly_trend:       str  = 'sideways'  # 1H trend (already in trend field, alias for clarity)
+
+    # ── v5 flags ──────────────────────────────────────────────
+    avwap_slope_ok:     bool = True    # False when an AVWAP bullish breakout failed the slope filter
+    bos_volume_confirmed: bool = False  # True when BOS/CHoCH happened on RVOL ≥ BOS_VOLUME_RVOL_MIN
+
 
 # ══════════════════════════════════════════════════════════════
 # INDICATOR WEIGHTS
@@ -114,6 +123,10 @@ INDICATOR_WEIGHTS: dict[str, float] = {
 
     # ── v3: Elliott Wave — wave personality ──────────────────
     'elliott_divergence':  2.0,
+
+    # ── v4: Market Context ────────────────────────────────────
+    'btc_anchor':          3.0,   # BTC as "market ocean" — high weight macro filter
+    'mtf_daily_align':     2.5,   # 1D trend aligns with 1H signal
 }
 
 
@@ -157,6 +170,52 @@ def _trend_from_ema(df_1h) -> str:
             return 'downtrend'
         return 'sideways'
     except Exception:
+        return 'sideways'
+
+
+def _trend_from_ema_df(df) -> str:
+    """Generic EMA-based trend detector — works on any timeframe DataFrame."""
+    if df is None or df.empty or len(df) < config.EMA_SLOW + 5:
+        return 'sideways'
+    try:
+        fast = df['close'].ewm(span=config.EMA_FAST, adjust=False).mean()
+        slow = df['close'].ewm(span=config.EMA_SLOW, adjust=False).mean()
+        if float(fast.iloc[-1]) > float(slow.iloc[-1]) * 1.002:
+            return 'uptrend'
+        if float(fast.iloc[-1]) < float(slow.iloc[-1]) * 0.998:
+            return 'downtrend'
+        return 'sideways'
+    except Exception:
+        return 'sideways'
+
+
+# Simple in-process cache for BTC anchor trend (5-min TTL).
+# Declared here BEFORE _get_btc_trend so the dependency order is explicit.
+_btc_trend_cache: dict = {}
+
+
+def _get_btc_trend() -> str:
+    """
+    Fetch BTC 1H bars and return its trend.
+    Called for every non-BTC ticker to enforce the Intermarket Anchor Filter.
+    Returns 'uptrend' | 'downtrend' | 'sideways'.
+    Cached for 5 minutes to avoid redundant API calls across tickers.
+    """
+    import time
+    now = time.time()
+    cached = _btc_trend_cache.get('result')
+    ts     = _btc_trend_cache.get('ts', 0)
+    if cached and (now - ts) < 300:   # 5-min TTL
+        return cached
+    try:
+        bars = fetch_multi_timeframe('BTCUSD')
+        trend = _trend_from_ema_df(bars.get('1h'))
+        _btc_trend_cache['result'] = trend
+        _btc_trend_cache['ts']     = now
+        logger.debug(f"BTC anchor trend refreshed: {trend}")
+        return trend
+    except Exception as e:
+        logger.debug(f"BTC anchor fetch error: {e}")
         return 'sideways'
 
 
@@ -291,6 +350,16 @@ def analyze(ticker: str) -> Optional[AnalysisResult]:
     # SMC LAYER (votes 6–15)
     # ══════════════════════════════════════════════════════════
 
+    # v5: pre-compute RVOL so BOS/CHoCH can use it for volume confirmation.
+    # The actual rvol_filter vote is still emitted later (in its original
+    # position) using this same result — we just need the value early.
+    rvol_early = None
+    try:
+        rvol_early = volume_relative(df_1h, lookback=20,
+                                     threshold=config.RVOL_MIN_THRESHOLD)
+    except Exception as e:
+        logger.debug(f"RVOL early-compute error ({ticker}): {e}")
+
     # ── 6. Order Block — 1H ──────────────────────────────────
     try:
         ob = order_block(df_1h,
@@ -325,25 +394,58 @@ def analyze(ticker: str) -> Optional[AnalysisResult]:
     except Exception as e:
         logger.debug(f"FVG error ({ticker}): {e}")
 
-    # ── 8. BOS / CHoCH — 1H ──────────────────────────────────
+    # ── 8. BOS / CHoCH — 1H (v5: volume-confirmed) ──────────
+    # When a structural break happens on RVOL ≥ BOS_VOLUME_RVOL_MIN, smart
+    # money is participating — the move is real. Weight is boosted ×1.30.
+    # When the break happens on anaemic volume, it's likely a fakeout —
+    # weight is reduced ×0.60. This is one of the highest-EV upgrades to
+    # SMC per Bellafiore's order-flow research.
+    bos_volume_confirmed = False
     try:
         bos = bos_choch(df_1h, max_bars=config.SMC_BOS_MAX_BARS)
         if bos is not None:
-            if bos.bullish_bos:
-                votes.append(IndicatorVote('smc_bos_choch', +1, INDICATOR_WEIGHTS['smc_bos_choch'],
-                    f'Bullish BOS — structure break up — 1H'))
-            elif bos.bearish_bos:
-                votes.append(IndicatorVote('smc_bos_choch', -1, INDICATOR_WEIGHTS['smc_bos_choch'],
-                    f'Bearish BOS — structure break down — 1H'))
-            elif bos.bullish_choch:
-                votes.append(IndicatorVote('smc_bos_choch', +1, INDICATOR_WEIGHTS['smc_bos_choch'],
-                    f'CHoCH bullish — trend reversal signal — 1H'))
-            elif bos.bearish_choch:
-                votes.append(IndicatorVote('smc_bos_choch', -1, INDICATOR_WEIGHTS['smc_bos_choch'],
-                    f'CHoCH bearish — trend reversal signal — 1H'))
+            base_weight = INDICATOR_WEIGHTS['smc_bos_choch']
+
+            # Determine the volume modifier
+            if rvol_early is not None and rvol_early.rvol >= config.BOS_VOLUME_RVOL_MIN:
+                vol_mult       = config.BOS_VOLUME_BOOST
+                vol_tag        = f'⚡ vol-confirmed RVOL={rvol_early.rvol:.1f}x'
+                bos_volume_confirmed = True
+            elif rvol_early is not None and rvol_early.rvol < 1.0:
+                vol_mult       = config.BOS_VOLUME_PENALTY
+                vol_tag        = f'⚠ low-vol RVOL={rvol_early.rvol:.1f}x (likely fakeout)'
             else:
-                votes.append(IndicatorVote('smc_bos_choch', 0, INDICATOR_WEIGHTS['smc_bos_choch'],
-                    'No BOS/CHoCH — 1H'))
+                vol_mult       = 1.0
+                vol_tag        = (f'RVOL={rvol_early.rvol:.1f}x'
+                                  if rvol_early is not None else 'no RVOL data')
+
+            adjusted_weight = base_weight * vol_mult
+
+            if bos.bullish_bos:
+                votes.append(IndicatorVote(
+                    'smc_bos_choch', +1, adjusted_weight,
+                    f'Bullish BOS — structure break up | {vol_tag} — 1H'
+                ))
+            elif bos.bearish_bos:
+                votes.append(IndicatorVote(
+                    'smc_bos_choch', -1, adjusted_weight,
+                    f'Bearish BOS — structure break down | {vol_tag} — 1H'
+                ))
+            elif bos.bullish_choch:
+                votes.append(IndicatorVote(
+                    'smc_bos_choch', +1, adjusted_weight,
+                    f'CHoCH bullish — trend reversal | {vol_tag} — 1H'
+                ))
+            elif bos.bearish_choch:
+                votes.append(IndicatorVote(
+                    'smc_bos_choch', -1, adjusted_weight,
+                    f'CHoCH bearish — trend reversal | {vol_tag} — 1H'
+                ))
+            else:
+                votes.append(IndicatorVote(
+                    'smc_bos_choch', 0, base_weight,
+                    'No BOS/CHoCH — 1H'
+                ))
     except Exception as e:
         logger.debug(f"BOS/CHoCH error ({ticker}): {e}")
 
@@ -514,9 +616,10 @@ def analyze(ticker: str) -> Optional[AnalysisResult]:
         logger.debug(f"Fractals error ({ticker}): {e}")
 
     # ── 20. Relative Volume / "In Play" Filter (Bellafiore) — 1H ─
+    # v5: re-uses the rvol_early result computed up-front for BOS/CHoCH
+    # confirmation. No need to recalculate.
     try:
-        rvol_1h = volume_relative(df_1h, lookback=20,
-                                  threshold=config.RVOL_MIN_THRESHOLD) if not df_1h.empty else None
+        rvol_1h = rvol_early   # reuse early-computed result
         if rvol_1h:
             if rvol_1h.is_in_play:
                 last_open_v  = float(df_1h['open'].iloc[-1])
@@ -610,6 +713,78 @@ def analyze(ticker: str) -> Optional[AnalysisResult]:
         logger.debug(f"Elliott divergence error ({ticker}): {e}")
 
     # ══════════════════════════════════════════════════════════
+    # v4: INTERMARKET ANCHOR — BTC Lead (vote 23)
+    # ══════════════════════════════════════════════════════════
+    # Bitcoin is the "ocean" that lifts or sinks all crypto boats.
+    # If BTC is in a downtrend, suppress altcoin BUY signals with a
+    # strong negative vote. If BTC is bullish, add a confirming boost.
+    # BTC itself skips this check — it IS the anchor.
+    btc_anchor_bullish = True   # default: assume fine
+    try:
+        if ticker != 'BTCUSD':
+            btc_trend = _get_btc_trend()
+            btc_anchor_bullish = (btc_trend != 'downtrend')
+            if btc_trend == 'uptrend':
+                votes.append(IndicatorVote(
+                    'btc_anchor', +1, INDICATOR_WEIGHTS['btc_anchor'],
+                    f'BTC anchor BULLISH — ocean rising, altcoin BUYs confirmed'
+                ))
+            elif btc_trend == 'downtrend':
+                votes.append(IndicatorVote(
+                    'btc_anchor', -1, INDICATOR_WEIGHTS['btc_anchor'],
+                    f'BTC anchor BEARISH — ocean falling, suppressing altcoin BUYs'
+                ))
+            else:
+                votes.append(IndicatorVote(
+                    'btc_anchor', 0, INDICATOR_WEIGHTS['btc_anchor'],
+                    f'BTC anchor SIDEWAYS — neutral market context'
+                ))
+        else:
+            # BTC analyzing itself — no anchor vote
+            btc_anchor_bullish = (trend != 'downtrend')
+    except Exception as e:
+        logger.debug(f"BTC anchor vote error ({ticker}): {e}")
+
+    # ══════════════════════════════════════════════════════════
+    # v4: MTF DAILY ALIGNMENT — Triple Screen veto (vote 24)
+    # ══════════════════════════════════════════════════════════
+    # Alexander Elder / Schwager: only trade in the direction of
+    # the "Big Tide" (1D trend). Misaligned 1H signals get a
+    # bearish vote; aligned signals get a bullish confirmation.
+    daily_trend_str = 'sideways'
+    try:
+        daily_trend_str = _trend_from_ema_df(df_1d)
+        if daily_trend_str == 'uptrend' and trend == 'uptrend':
+            votes.append(IndicatorVote(
+                'mtf_daily_align', +1, INDICATOR_WEIGHTS['mtf_daily_align'],
+                'MTF: 1D uptrend ✓ aligns with 1H uptrend — high-tide entry'
+            ))
+        elif daily_trend_str == 'downtrend' and trend == 'downtrend':
+            votes.append(IndicatorVote(
+                'mtf_daily_align', -1, INDICATOR_WEIGHTS['mtf_daily_align'],
+                'MTF: 1D downtrend ✓ aligns with 1H downtrend — confirmed short bias'
+            ))
+        elif daily_trend_str == 'uptrend' and trend == 'downtrend':
+            # 1H counter-trend pullback in a daily uptrend — reduce bearish conviction
+            votes.append(IndicatorVote(
+                'mtf_daily_align', +1, INDICATOR_WEIGHTS['mtf_daily_align'] * 0.6,
+                'MTF: 1D uptrend but 1H pullback — potential bounce, weak bull'
+            ))
+        elif daily_trend_str == 'downtrend' and trend == 'uptrend':
+            # 1H bounce in a daily downtrend — most dangerous scenario
+            votes.append(IndicatorVote(
+                'mtf_daily_align', -1, INDICATOR_WEIGHTS['mtf_daily_align'],
+                'MTF: 1D downtrend + 1H bounce — COUNTER-TREND, veto BUY'
+            ))
+        else:
+            votes.append(IndicatorVote(
+                'mtf_daily_align', 0, INDICATOR_WEIGHTS['mtf_daily_align'],
+                f'MTF: 1D={daily_trend_str} / 1H={trend} — no clear alignment'
+            ))
+    except Exception as e:
+        logger.debug(f"MTF daily align error ({ticker}): {e}")
+
+    # ══════════════════════════════════════════════════════════
     # AGGREGATE
     # ══════════════════════════════════════════════════════════
 
@@ -633,7 +808,18 @@ def analyze(ticker: str) -> Optional[AnalysisResult]:
         trap_1h.trap_type is not None and
         trap_1h.bars_ago <= config.TRAP_MAX_BARS
     )
-    trap_sig           = (trap_1h.signal if trap_active and trap_1h else 'none')
+
+    # Derive the signal direction from trap_type
+    trap_sig = 'none'
+    if trap_active and trap_1h:
+        trap_sig = 'sell' if trap_1h.trap_type == 'bull_trap' else 'buy'
+
+    # ── v5 flags ─────────────────────────────────────────────
+    # avwap_slope_ok lets signal_generator check the slope filter via a
+    # structured field rather than parsing the vote reason string.
+    avwap_slope_ok = True
+    if pinch_1h is not None:
+        avwap_slope_ok = bool(pinch_1h.slope_filter)
 
     logger.debug(
         f"Analysis {ticker}: trend={trend} bull={bull_score:.0%} "
@@ -652,4 +838,9 @@ def analyze(ticker: str) -> Optional[AnalysisResult]:
         wave5_warning=wave5_warning,
         trap_active=trap_active,
         trap_signal=trap_sig,
+        btc_anchor_bullish=btc_anchor_bullish,
+        daily_trend=daily_trend_str,
+        hourly_trend=trend,
+        avwap_slope_ok=avwap_slope_ok,
+        bos_volume_confirmed=bos_volume_confirmed,
     )
