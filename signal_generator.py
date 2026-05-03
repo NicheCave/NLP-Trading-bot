@@ -358,13 +358,23 @@ def generate_signal(ticker: str) -> Signal:
             confidence = min(1.0, confidence * 1.08)
             reason += ' | Alligator eating bull'
 
-        # v3: AVWAP breakout with slope filter → boost
-        if _get_vote(analysis, 'avwap_pinch') == +1 and not _avwap_slope_filter_failed(analysis):
+        # v6: AVWAP slope filter is now a hard gate, not just a penalty.
+        # If price broke the AVWAP pinch but slope is still flat/down, the
+        # breakout has no momentum behind it — historically our worst entries.
+        # A failed slope filter produces an immediate HOLD rather than a
+        # reduced-confidence BUY that still burns daily trade quota.
+        if _avwap_slope_filter_failed(analysis):
+            logger.info(
+                f"HOLD {ticker}: AVWAP slope filter failed — "
+                f"breakout lacks momentum, suppressing BUY"
+            )
+            return Signal(
+                ticker, 'HOLD', 0.0, net, bull, bear, n_votes,
+                f'[AVWAP SLOPE GATE] AVWAP pinch fired but slope filter ✗ — no momentum | {reason}'
+            )
+        if _get_vote(analysis, 'avwap_pinch') == +1:
             confidence = min(1.0, confidence * 1.10)
             reason += ' | AVWAP pinch breakout (slope ✓)'
-        elif _avwap_slope_filter_failed(analysis):
-            confidence *= 0.80
-            reason += ' | AVWAP slope filter ✗ (reduced)'
 
         # v3: AO bullish cross → additional momentum confirmation
         ao_vote = _get_vote(analysis, 'williams_ao')

@@ -44,7 +44,7 @@ CRYPTO_MIN_AVG_SCORE  = 0.22   # raised from 0.15 — kills marginal-edge signal
 # ── Risk Management ───────────────────────────────────────────
 CRYPTO_RISK_PER_TRADE  = 0.01   # 1% of portfolio per trade
 CRYPTO_STOP_LOSS_PCT   = 0.05   # 5% stop-loss
-CRYPTO_TAKE_PROFIT_PCT = 0.15   # 15% take-profit — asymmetric 3:1 R:R (was 0.10) (v5)
+CRYPTO_TAKE_PROFIT_PCT = 0.07   # 7% take-profit — reachable within time stop window (was 0.15) (v6)
 
 USE_ATR_STOP        = True
 ATR_STOP_MULTIPLIER = 1.5
@@ -96,13 +96,13 @@ ALLIGATOR_SPREAD_PCT = 0.3
 # Minimum RVOL multiple to consider an asset "in play" for entry.
 # 1.5x = at least 50% more volume than the rolling 20-bar average.
 # Only assets above this threshold have confirmed institutional presence.
-RVOL_MIN_THRESHOLD = 1.5
+RVOL_MIN_THRESHOLD = 2.0  # (v6: raised from 1.5 — 2× volume confirms stronger institutional presence)
 
 # ── v3: Bellafiore — Pyramiding ───────────────────────────────
 # Minimum unrealized P&L as a multiple of ATR before scaling in.
 # 1.0 = position must be 1 ATR profitable before we add.
 # Higher = more conservative pyramiding; lower = more aggressive.
-PYRAMID_MIN_ATR_FACTOR = 1.0
+PYRAMID_MIN_ATR_FACTOR = 2.0  # (v6: raised from 1.0 — position must be 2 ATR profitable before scaling in)
 
 # ── v3: Jack Schwager — Trap Detector ────────────────────────
 # Maximum age (in bars) of a trap pattern for it to still be actionable.
@@ -149,7 +149,7 @@ MTF_BUY_MIN_DAILY_TREND = 'sideways'   # set to 'uptrend' for strictest mode
 # ── v4: Time-Based Stops ──────────────────────────────────────
 # If a position hasn't hit TP or SL after this many hours, exit at market.
 # Steenbarger/Bellafiore: time is risk. Zombie trades occupy capital.
-TIME_STOP_HOURS = 12
+TIME_STOP_HOURS = 48  # (v6: was 12 — 12h was too short for a 7% TP target; 48h gives price room to breathe)
 
 # ── v4: ATR Trailing Stop ─────────────────────────────────────
 # Multiplier for the ATR-based trailing stop.

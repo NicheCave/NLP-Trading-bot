@@ -206,6 +206,9 @@ def is_market_open(ticker: str) -> bool:
 
 def _get_current_price(ticker: str, order_symbol: str) -> float | None:
     """Fetch latest price for a ticker."""
+    if is_crypto(ticker) and '/' not in order_symbol:
+        order_symbol = to_order_symbol(ticker)
+
     if is_crypto(ticker):
         try:
             request = CryptoLatestBarRequest(symbol_or_symbols=order_symbol)
@@ -415,6 +418,7 @@ def check_exits():
         stop = config.CRYPTO_STOP_LOSS_PCT
 
         # ── Fetch current price (needed for trailing stop) ────
+        price_symbol = to_order_symbol(internal)
         current_price = _get_current_price(internal, symbol)
 
         # ── Update trailing high watermark ────────────────────
