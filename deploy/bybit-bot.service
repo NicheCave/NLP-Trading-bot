@@ -1,0 +1,60 @@
+# systemd unit for the Bybit futures bot.
+#
+#   sudo cp deploy/bybit-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now bybit-bot
+#   journalctl -u bybit-bot -f
+#
+# Adjust User= and the paths if you didn't clone to /opt/bybit-bot.
+
+[Unit]
+Description=Bybit perpetual futures bot
+# Don't start before the network AND the clock are ready. Bybit rejects
+# signed requests whose timestamp is more than ~1s fast, and a VM's clock
+# is at its worst in the seconds right after boot.
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+# Never give up restarting. With a start limit, a Bybit maintenance window
+# longer than a few minutes would make systemd stop retrying for good, and
+# on an unattended box nobody would notice. A genuinely broken bot is caught
+# by the external heartbeat instead.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/bybit-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/bybit-bot/venv/bin/python main.py --mode demo
+
+# Survive crashes and reboots. The bot is stateful — it tracks open
+# positions in logs/executor_state.json — so coming back up and
+# reconciling against the exchange is exactly the right behaviour.
+Restart=always
+RestartSec=30
+
+# Weekly clean restart. Insurance for long unattended runs: any slow leak or
+# wedged connection pool is cleared, and Restart=always brings it straight
+# back. Safe to do because the bot is designed to recover — on boot it
+# reconciles logs/executor_state.json against the exchange, and open
+# positions keep their exchange-resident stops throughout.
+RuntimeMaxSec=604800
+
+# journald handles rotation; the bot also writes its own logs/ files.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bybit-bot
+
+# --- hardening -------------------------------------------------------
+# The bot needs outbound HTTPS and its own directory. Nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/bybit-bot/logs /opt/bybit-bot/cache
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

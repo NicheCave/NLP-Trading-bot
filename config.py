@@ -1,69 +1,191 @@
-# config.py — crypto-only configuration (TA + SMC + Advanced TA, v3)
+# config.py — Bybit USDT-perpetual futures configuration (v7)
 # ─────────────────────────────────────────────────────────────
-# Changes from v2:
-#   - Added RVOL_MIN_THRESHOLD      (Bellafiore "Stocks in Play" filter)
-#   - Added TRAP_MAX_BARS           (Schwager trap detector staleness window)
-#   - Added EDGE_LOG_INTERVAL       (Steenbarger edge report frequency)
-#   - Added PYRAMID_MIN_ATR_FACTOR  (Bellafiore: min ATR profit before scaling)
-#   - Added AVWAP_LOOKBACK          (Shannon: bar window for AVWAP pivot detection)
-#   - Added ALLIGATOR_SPREAD_PCT    (Williams: threshold for sleeping detection)
-#   - Added ELLIOTT_LOOKBACK        (wave divergence lookback window)
-#   - All v2 settings preserved unchanged
+# Migrated from Alpaca crypto SPOT (long-only) to Bybit linear perpetuals
+# traded in BOTH directions on the Demo Trading environment.
+#
+# What changed from v6, and why:
+#   - Exchange is Bybit v5; symbols are perps (BTCUSDT, not BTC/USD).
+#   - Risk is now expressed as "% of equity lost when the stop is hit",
+#     which is what RISK_PER_TRADE always claimed to mean but never did.
+#   - Stops and targets are ATR multiples, not flat percentages, so they
+#     scale with each symbol's volatility instead of treating BTC and SOL
+#     as if they move the same amount.
+#   - Funding is a first-class cost and a signal input.
+#
+# Every legacy indicator threshold is preserved verbatim so the backtest
+# baseline measures the CURRENT strategy, not a re-tuned one. Changes get
+# made after the baseline exists, never before.
 # ─────────────────────────────────────────────────────────────
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── API Credentials ───────────────────────────────────────────
-ALPACA_API_KEY    = os.getenv('ALPACA_API_KEY')
-ALPACA_SECRET_KEY = os.getenv('ALPACA_SECRET_KEY')
-ALPACA_BASE_URL   = os.getenv('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets')
+# ══════════════════════════════════════════════════════════════
+# EXCHANGE / CREDENTIALS
+# ══════════════════════════════════════════════════════════════
 
-# ── Symbol mappings ───────────────────────────────────────────
-ALPACA_ORDER_SYMBOL = {
-    'BTCUSD':  'BTC/USD',
-    'ETHUSD':  'ETH/USD',
-    'SOLUSD':  'SOL/USD',
-    'DOGEUSD': 'DOGE/USD',
-}
+BYBIT_API_KEY    = os.getenv('BYBIT_API_KEY')
+BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
 
-CRYPTO_TICKERS = set(ALPACA_ORDER_SYMBOL.keys())
+# Demo Trading runs inside the real platform: genuine mainnet prices,
+# spreads and liquidity, but fake money. Bybit's own guidance is to use
+# Demo rather than Testnet when evaluating a strategy, because Testnet is
+# separate infrastructure whose prices don't resemble the real market.
+#
+# Keys must be minted from the Demo Trading section of a MAINNET account.
+BYBIT_DEMO    = os.getenv('BYBIT_DEMO', 'true').lower() == 'true'
+BYBIT_TESTNET = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
 
-# ── Watchlist ─────────────────────────────────────────────────
-_raw = os.getenv('WATCHLIST', 'BTCUSD,ETHUSD,SOLUSD')
-WATCHLIST = [t.strip() for t in _raw.split(',') if t.strip() in CRYPTO_TICKERS]
-if not WATCHLIST:
-    WATCHLIST = ['BTCUSD', 'ETHUSD', 'SOLUSD']
+CATEGORY = 'linear'          # USDT-margined perpetuals
 
-# ── Signal Thresholds ─────────────────────────────────────────
-CRYPTO_BUY_THRESHOLD  = 0.35
-CRYPTO_SELL_THRESHOLD = 0.35
-CRYPTO_MIN_AVG_SCORE  = 0.22   # raised from 0.15 — kills marginal-edge signals (v5)
+# ══════════════════════════════════════════════════════════════
+# UNIVERSE
+# ══════════════════════════════════════════════════════════════
 
-# ── Risk Management ───────────────────────────────────────────
-CRYPTO_RISK_PER_TRADE  = 0.01   # 1% of portfolio per trade
-CRYPTO_STOP_LOSS_PCT   = 0.05   # 5% stop-loss
-CRYPTO_TAKE_PROFIT_PCT = 0.07   # 7% take-profit — reachable within time stop window (was 0.15) (v6)
+# Screened from Bybit's full linear-perp list on three criteria, because
+# widening the universe is the only way to raise trade frequency WITHOUT
+# lowering the conviction bar — and lowering the bar was measured to be
+# actively destructive (gross expectancy goes negative below |net| ~0.35).
+#
+#   ≥730 days of 1H history   the walk-forward needs two years; new listings
+#                             cannot be validated and would be pure guesswork
+#   spread ≤3.5 bps           the spread is a cost paid on every round trip;
+#                             the backtest assumes 2 bps of slippage per side
+#   ≥$20M daily turnover      thin books make that slippage assumption a lie
+#
+# Deliberately EXCLUDED despite high turnover: tokenised equities and
+# commodities (SOXLUSDT, SPCXUSDT, SNDKUSDT, SKHYNIXUSDT, XAUUSDT). They
+# have market-hours gaps and are driven by things this stack never models,
+# and the strategy was validated exclusively on 24/7 crypto.
+_raw_symbols = os.getenv(
+    'SYMBOLS',
+    'BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,BNBUSDT,LINKUSDT,NEARUSDT,SUIUSDT,WLDUSDT'
+)
+SYMBOLS = [s.strip().upper() for s in _raw_symbols.split(',') if s.strip()]
 
-USE_ATR_STOP        = True
-ATR_STOP_MULTIPLIER = 1.5
+# BTC is the market's tide — used as the intermarket anchor for alts.
+ANCHOR_SYMBOL = 'BTCUSDT'
 
-MAX_DAILY_TRADES_CRYPTO = 40
-MAX_OPEN_POSITIONS      = 4
+QUOTE_CURRENCY = 'USDT'
 
-# ── Schedule ──────────────────────────────────────────────────
-CHECK_INTERVAL      = 4    # TA + SMC + AdvTA analysis cycle (minutes)
+# ══════════════════════════════════════════════════════════════
+# FUTURES MECHANICS
+# ══════════════════════════════════════════════════════════════
+
+# Leverage caps notional; it is NOT the risk lever. Risk is set by the
+# stop distance (see RISK_PER_TRADE). Leverage only decides how much
+# margin the exchange locks up and where liquidation sits.
+LEVERAGE     = float(os.getenv('LEVERAGE', '3'))
+MARGIN_MODE  = 'ISOLATED'    # per-position margin — one bad trade can't
+                             # cascade into the rest of the book
+POSITION_MODE = 'one_way'    # positionIdx=0; no simultaneous long+short
+
+# Stops trigger off MARK price, not last price. Last price can be wicked
+# by a thin book; mark price is index-anchored and much harder to push.
+TRIGGER_PRICE_TYPE = 'MarkPrice'
+
+# Signature validity window, in milliseconds. Bybit rejects a request whose
+# timestamp is further than this from ITS clock (retCode 10002).
+#
+# The default of 5000 assumes a well-synchronised machine. Windows clocks
+# routinely drift several seconds, which produces intermittent rejections —
+# including, potentially, on an order. This is a tolerance, NOT a fix: if
+# you see 10002, resync the system clock (`w32tm /resync /force`).
+RECV_WINDOW = 20_000
+
+# api-demo.bybit.com drops idle keep-alive connections far more often than
+# mainnet. These retries are handled inside pybit and usually succeed.
+HTTP_TIMEOUT     = 30
+HTTP_MAX_RETRIES = 3
+HTTP_RETRY_DELAY = 2
+
+# How often to poll the exchange for positions while holding nothing. The
+# management loop runs every EXIT_INTERVAL seconds, but with nothing open
+# there is nothing to manage — polling that often just multiplies the
+# chance of hitting a connection reset.
+FLAT_POLL_INTERVAL = 300   # seconds
+
+# ══════════════════════════════════════════════════════════════
+# RISK
+# ══════════════════════════════════════════════════════════════
+
+# Fraction of equity lost if the stop is hit. This is real risk now:
+#   qty = (equity × RISK_PER_TRADE) / |entry − stop|
+RISK_PER_TRADE = 0.01        # 1%
+
+MAX_OPEN_POSITIONS = 4
+
+# Total simultaneous risk across all open positions. With 1% per trade and
+# 4 positions the theoretical max is 4%, but BTC/ETH/SOL are ~0.8
+# correlated — in a hard sell-off all four stops fill together, so this is
+# effectively one 4% bet, not four independent 1% ones.
+MAX_PORTFOLIO_HEAT = 0.04
+
+# Correlated exposure cap: how many positions may face the same direction
+# at once given how tightly majors move together.
+MAX_CORRELATED_POSITIONS = 2
+CORRELATION_THRESHOLD    = 0.75
+CORRELATION_LOOKBACK     = 168   # 1 week of 1H bars
+
+# ── Stops and targets (ATR-based) ─────────────────────────────
+# Replaces the flat 5% / 7% of v6, which applied the same distance to BTC
+# and SOL despite very different volatility.
+ATR_PERIOD           = 14
+ATR_STOP_MULTIPLIER  = 1.8   # stop distance = 1.8 × ATR
+ATR_TARGET_MULTIPLIER = 3.6  # target distance = 3.6 × ATR → 2.0 R
+MIN_STOP_PCT         = 0.004  # floor: never place a stop inside noise
+MAX_STOP_PCT         = 0.08   # ceiling: refuse absurdly wide stops
+
+# ATR trailing stop, applied once a trade is meaningfully in profit.
+TRAILING_ATR_MULTIPLIER = 2.0
+TRAILING_ACTIVATE_R     = 1.0   # only start trailing after +1R
+
+# ── Time stop ─────────────────────────────────────────────────
+# Perps charge funding every 8h, so a stale position bleeds on a schedule.
+TIME_STOP_HOURS = 48
+
+# Bail out early if funding turns strongly against the position: holding a
+# long while paying elevated funding is a negative-carry bet that needs the
+# price move to outrun the cost.
+FUNDING_EXIT_THRESHOLD = 0.0005   # 0.05% per 8h ≈ 55% annualised
+
+# ── Costs (must match live Bybit fees for the backtest to mean anything) ──
+TAKER_FEE    = 0.00055    # 0.055%
+MAKER_FEE    = 0.0002     # 0.02%
+SLIPPAGE_BPS = 2.0
+
+# ══════════════════════════════════════════════════════════════
+# SCHEDULE
+# ══════════════════════════════════════════════════════════════
+
+CHECK_INTERVAL      = 4    # analysis cycle (minutes)
 EXECUTION_INTERVAL  = 20   # order execution check (seconds)
-EXIT_INTERVAL       = 30   # stop/TP check (seconds)
-DAILY_SYNC_INTERVAL = 60   # daily trade counter sync (seconds)
+EXIT_INTERVAL       = 30   # local stop/TP safety net (seconds)
+DAILY_SYNC_INTERVAL = 60   # state reconciliation (seconds)
+EDGE_LOG_INTERVAL   = 240  # edge report (minutes)
 
-# Steenbarger edge report frequency (minutes)
-# Every 4 hours is a reasonable default — enough trades to be meaningful
-# but not so frequent that it floods the log.
-EDGE_LOG_INTERVAL = 240    # minutes (4 hours)
+MAX_DAILY_TRADES = 40
 
-# ── Indicator parameters (existing) ──────────────────────────
+# ══════════════════════════════════════════════════════════════
+# SIGNAL THRESHOLDS  (preserved from v6 for baseline fidelity)
+# ══════════════════════════════════════════════════════════════
+
+BUY_THRESHOLD  = 0.35
+SELL_THRESHOLD = 0.35
+MIN_AVG_SCORE  = 0.22
+CONFIDENCE_FLOOR = 0.25
+
+# Legacy aliases — older modules still reference the CRYPTO_* names.
+CRYPTO_BUY_THRESHOLD  = BUY_THRESHOLD
+CRYPTO_SELL_THRESHOLD = SELL_THRESHOLD
+CRYPTO_MIN_AVG_SCORE  = MIN_AVG_SCORE
+CRYPTO_RISK_PER_TRADE = RISK_PER_TRADE
+
+# ══════════════════════════════════════════════════════════════
+# INDICATOR PARAMETERS  (preserved verbatim from v6)
+# ══════════════════════════════════════════════════════════════
+
 EMA_FAST    = 9
 EMA_SLOW    = 21
 RSI_PERIOD  = 14
@@ -72,132 +194,75 @@ MACD_SLOW   = 26
 MACD_SIGNAL = 9
 BB_PERIOD   = 20
 BB_STD      = 2.0
-ATR_PERIOD  = 14
 
-# ── SMC parameters (existing) ────────────────────────────────
+# ── SMC ───────────────────────────────────────────────────────
 SMC_OB_IMPULSE_PCT    = 1.2
 SMC_OB_PROXIMITY_PCT  = 2.0
 SMC_FVG_PROXIMITY_PCT = 1.5
 SMC_BOS_MAX_BARS      = 3
 SMC_SWEEP_MAX_BARS    = 2
 
-# ── v3: Brian Shannon — Anchored VWAP ────────────────────────
-# Number of bars to scan for the anchor pivots (swing high/low).
-# 60 hourly bars = ~2.5 days — captures recent institutional events.
-AVWAP_LOOKBACK = 60
-
-# ── v3: Bill Williams — Alligator ────────────────────────────
-# Below this spread % between jaw/teeth/lips, the market is "sleeping".
-# 0.3% is Williams' original guidance adapted for crypto volatility.
-# Raise to 0.5% for lower-volatility assets.
+# ── Advanced TA ───────────────────────────────────────────────
+AVWAP_LOOKBACK       = 60
 ALLIGATOR_SPREAD_PCT = 0.3
+RVOL_MIN_THRESHOLD   = 2.0
+PYRAMID_MIN_ATR_FACTOR = 2.0
+TRAP_MAX_BARS        = 5
+ELLIOTT_LOOKBACK     = 50
 
-# ── v3: Bellafiore — Relative Volume ("Stocks in Play") ──────
-# Minimum RVOL multiple to consider an asset "in play" for entry.
-# 1.5x = at least 50% more volume than the rolling 20-bar average.
-# Only assets above this threshold have confirmed institutional presence.
-RVOL_MIN_THRESHOLD = 2.0  # (v6: raised from 1.5 — 2× volume confirms stronger institutional presence)
+BOS_VOLUME_RVOL_MIN = 1.5
+BOS_VOLUME_BOOST    = 1.30
+BOS_VOLUME_PENALTY  = 0.60
 
-# ── v3: Bellafiore — Pyramiding ───────────────────────────────
-# Minimum unrealized P&L as a multiple of ATR before scaling in.
-# 1.0 = position must be 1 ATR profitable before we add.
-# Higher = more conservative pyramiding; lower = more aggressive.
-PYRAMID_MIN_ATR_FACTOR = 2.0  # (v6: raised from 1.0 — position must be 2 ATR profitable before scaling in)
+PYRAMID_MIN_INTERVAL_SEC = CHECK_INTERVAL * 60
 
-# ── v3: Jack Schwager — Trap Detector ────────────────────────
-# Maximum age (in bars) of a trap pattern for it to still be actionable.
-# A bull trap detected 10 bars ago is already played out.
-# 5 bars = ~5 hours on 1H chart — still relevant for a momentum flip.
-TRAP_MAX_BARS = 5
-
-# ── v3: Elliott Wave — Divergence Lookback ───────────────────
-# Number of 1H bars to scan for swing highs/lows when detecting
-# RSI divergence (Wave 3 / Wave 5 identification).
-ELLIOTT_LOOKBACK = 50
-
-# ── v4: Institutional "Kill Zones" ────────────────────────────
-# Smart money (institutional) volume concentrates at session overlaps.
-# Signals outside these windows are more likely retail noise.
-# All times are UTC.  Set KILL_ZONES_ENABLED=False to disable.
+# ── Kill zones (UTC) ──────────────────────────────────────────
+# Retained for the baseline, but flagged for measurement: this is FX and
+# equities session logic applied to a market that never closes. Phase 5
+# tests it against measured hour-of-week performance rather than assuming.
 KILL_ZONES_ENABLED = True
-
 KILL_ZONES = [
-    # (label,        start_hour_utc, end_hour_utc)
-    # IMPORTANT: Overlap MUST come before NY because (13–15) ⊂ (13–16).
-    # The matcher returns the first hit, so Overlap has to be tested first
-    # or it'd be shadowed by NY and never reported. (v5 fix)
-    ('Overlap',     13,  15),   # London–NY overlap — THE highest-probability window
-    ('London',       8,  11),   # London open — strong EUR/GBP/BTC correlation
-    ('NY',          13,  16),   # New York open — highest USD-denominated volume
-    ('Asia',         0,   3),   # Tokyo/Singapore open — BTC/ETH deepest Asian vol
+    ('Overlap', 13, 15),   # must precede NY — (13,15) ⊂ (13,16)
+    ('London',   8, 11),
+    ('NY',      13, 16),
+    ('Asia',     0,  3),
 ]
-
-# Confidence penalty (multiplier) applied to signals generated OUTSIDE kill zones.
-# 0.80 = 20% confidence haircut for "off-hours" entries.
 KILL_ZONE_OFF_HOURS_PENALTY = 0.80
 
-# ── v4: MTF Daily Alignment ───────────────────────────────────
-# If 1D trend opposes the 1H signal direction, apply this confidence penalty.
-# 0.70 = 30% haircut for counter-trend trades (still allows them but shrinks size).
-MTF_COUNTER_TREND_PENALTY  = 0.70
+# ── MTF ───────────────────────────────────────────────────────
+MTF_COUNTER_TREND_PENALTY = 0.70
+MTF_BUY_MIN_DAILY_TREND   = 'sideways'
 
-# Minimum daily_trend requirement for a BUY to get full size.
-# 'uptrend'  → only buy when 1D is also bullish
-# 'sideways' → allow buys in sideways + uptrend (less strict)
-MTF_BUY_MIN_DAILY_TREND = 'sideways'   # set to 'uptrend' for strictest mode
+# ── Loss-streak cooldown ──────────────────────────────────────
+LOSS_STREAK_THRESHOLD    = 2
+LOSS_STREAK_COOLDOWN_HRS = 6
 
-# ── v4: Time-Based Stops ──────────────────────────────────────
-# If a position hasn't hit TP or SL after this many hours, exit at market.
-# Steenbarger/Bellafiore: time is risk. Zombie trades occupy capital.
-TIME_STOP_HOURS = 48  # (v6: was 12 — 12h was too short for a 7% TP target; 48h gives price room to breathe)
+# ══════════════════════════════════════════════════════════════
+# BACKTEST
+# ══════════════════════════════════════════════════════════════
 
-# ── v4: ATR Trailing Stop ─────────────────────────────────────
-# Multiplier for the ATR-based trailing stop.
-# 2.0 × ATR  keeps stop wide enough to breathe but still locks in profits.
-TRAILING_ATR_MULTIPLIER = 2.0
+BACKTEST_DAYS           = 730
+BACKTEST_INITIAL_EQUITY = 10_000.0
+BACKTEST_WARMUP_BARS    = 300
 
-# ─────────────────────────────────────────────────────────────
-# v5: NEW EDGE CONSTANTS + BUG-FIX KNOBS
-# ─────────────────────────────────────────────────────────────
+# Bars of 1H history handed to the indicator stack per decision.
+# The live path and the backtest MUST use the same number — otherwise the
+# backtest scores a different strategy than the one that trades. 400 bars
+# comfortably covers the longest lookback in the stack (AVWAP 60, Elliott
+# 50, fractals 60) with room for the recursive EMAs/SMMAs to converge.
+ANALYSIS_WINDOW_BARS = 400
 
-# ── v5: Confidence floor (signal_generator) ───────────────────
-# After all stacking penalties (counter-trend × kill-zone × wave5 × bear),
-# confidence can compound down to single digits. Below this threshold the
-# signal is downgraded to HOLD instead of placing a tiny token order.
-# 0.25 = 25% — anything weaker is just clutter and burns daily-trade quota.
-CONFIDENCE_FLOOR = 0.25
+# ══════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════
 
-# ── v5: Loss-streak cooldown ──────────────────────────────────
-# After this many consecutive losses on the same ticker, freeze new BUYs
-# on that ticker for COOLDOWN_HOURS. Steenbarger "tilt insurance":
-# losing streaks correlate with regime changes the model hasn't adapted to.
-LOSS_STREAK_THRESHOLD     = 2
-LOSS_STREAK_COOLDOWN_HRS  = 6
+def is_anchor(symbol: str) -> bool:
+    return symbol == ANCHOR_SYMBOL
 
-# ── v5: Volume-confirmed BOS / CHoCH ──────────────────────────
-# A structural break on average volume is much weaker than one on RVOL ≥ 1.5.
-# When RVOL meets this threshold during a BOS/CHoCH, the smc_bos_choch vote
-# weight is multiplied by BOOST. When RVOL is anaemic, the vote is REDUCED.
-BOS_VOLUME_RVOL_MIN  = 1.5
-BOS_VOLUME_BOOST     = 1.30   # weight × 1.30 when volume confirms
-BOS_VOLUME_PENALTY   = 0.60   # weight × 0.60 when volume is weak
 
-# ── v5: Pyramiding storm guard ────────────────────────────────
-# Minimum interval (in seconds) between two scale-ins on the same ticker.
-# Without this, scale_in_winner would fire every EXECUTION_INTERVAL while
-# the cached signal still says add_to_winner=True — turning a 50% pyramid
-# into a 600% one inside a single 4-minute analysis cycle.
-# Default = one full analysis cycle worth of seconds.
-PYRAMID_MIN_INTERVAL_SEC = CHECK_INTERVAL * 60   # 240 s by default
+def credentials_present() -> bool:
+    """True when live/demo trading is possible. Backtests need no keys."""
+    return bool(BYBIT_API_KEY and BYBIT_API_SECRET)
 
-# ── Helper functions ──────────────────────────────────────────
-def is_crypto(ticker: str) -> bool:
-    return ticker in CRYPTO_TICKERS
 
-def to_order_symbol(ticker: str) -> str:
-    return ALPACA_ORDER_SYMBOL.get(ticker, ticker)
-
-# ── Device ────────────────────────────────────────────────────
-# Torch/CUDA removed: all computation is pure NumPy/Pandas.
-# Keeping this constant so any code that reads config.DEVICE still works.
 DEVICE = 'cpu'

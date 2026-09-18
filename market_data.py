@@ -1,124 +1,86 @@
-# market_data.py — OHLCV bar fetcher via Alpaca (replaces data_fetcher.py)
+# market_data.py — OHLCV access for the live bot (Bybit perpetuals).
 # ─────────────────────────────────────────────────────────────
-# Fetches candlestick data at multiple timeframes for TA.
-# Crypto only. No NLP, no news APIs.
+# Thin convenience layer over data/bybit_data.py, kept because the rest of
+# the bot already speaks this interface. All the real work — pagination,
+# caching, partial-bar handling — lives in the data package.
+#
+# Two behavioural changes from the Alpaca version:
+#   - The still-forming bar is excluded. Indicators computed on a partial
+#     candle flip between cycles and produce entries on levels that never
+#     actually printed.
+#   - The 1m timeframe is gone. It was fetched every cycle and never read.
 # ─────────────────────────────────────────────────────────────
-from alpaca.data.historical.crypto import CryptoHistoricalDataClient
-from alpaca.data.requests import CryptoBarsRequest, CryptoLatestBarRequest
-from alpaca.data.timeframe import TimeFrame
-from loguru import logger
-from datetime import datetime, timedelta, timezone
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+
 import pandas as pd
+from loguru import logger
+
 import config
+from data import get_klines, get_last_price
 
-_client = CryptoHistoricalDataClient(
-    api_key=config.ALPACA_API_KEY,
-    secret_key=config.ALPACA_SECRET_KEY,
-)
+# Internal timeframe label → Bybit interval code.
+TIMEFRAMES = {
+    '1h': '60',
+    '4h': '240',
+    '1d': 'D',
+}
+
+# How much history each timeframe needs to warm up its slowest indicator.
+DEFAULT_DAYS = {
+    '1h': 30,     # ~720 bars
+    '4h': 120,
+    '1d': 400,
+}
 
 
-def _to_alpaca_symbol(ticker: str) -> str:
-    """Convert internal ticker (BTCUSD) to Alpaca bar format (BTC/USD)."""
-    return config.ALPACA_ORDER_SYMBOL.get(ticker, ticker)
-
-
-def fetch_bars(ticker: str, timeframe: TimeFrame, limit: int = 200) -> pd.DataFrame:
+def fetch_bars(symbol: str, timeframe: str = '1h', days: float | None = None) -> pd.DataFrame:
     """
-    Fetch OHLCV candlesticks for a crypto ticker.
+    Fetch closed OHLCV candles for one perpetual.
 
     Args:
-        ticker:    Internal ticker e.g. 'BTCUSD'
-        timeframe: alpaca TimeFrame — e.g. TimeFrame.Minute, TimeFrame.Hour, TimeFrame.Day
-        limit:     Number of bars to fetch (max 1000)
+        symbol:    Bybit symbol, e.g. 'BTCUSDT'
+        timeframe: '1h' | '4h' | '1d'
+        days:      history window; defaults to DEFAULT_DAYS[timeframe]
 
     Returns:
-        DataFrame with columns: open, high, low, close, volume, vwap
-        Indexed by timestamp (UTC). Returns empty DataFrame on error.
+        DataFrame[open, high, low, close, volume, turnover] indexed UTC,
+        ascending. Empty on failure — callers must handle that.
     """
-    symbol = _to_alpaca_symbol(ticker)
-    # Alpaca requires a start time — fetch enough history to cover `limit` bars
-    # Use a generous window so we always get enough data even on weekends/gaps
-    days_back = max(limit // 24 + 5, 7)  # rough heuristic — overestimate then slice
-    start = datetime.now(timezone.utc) - timedelta(days=days_back)
+    interval = TIMEFRAMES.get(timeframe)
+    if interval is None:
+        logger.warning(f"Unknown timeframe {timeframe!r}")
+        return pd.DataFrame()
 
     try:
-        req = CryptoBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=timeframe,
-            start=start,
-        )
-        bars = _client.get_crypto_bars(req)
-        df = bars.df
-
-        if df.empty:
-            logger.warning(f"No bars returned for {ticker} ({timeframe})")
-            return pd.DataFrame()
-
-        # Multi-symbol response wraps in MultiIndex — flatten
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.xs(symbol, level='symbol')
-
-        df = df.sort_index()
-        df = df.tail(limit)  # keep only `limit` most recent bars
-
-        df.columns = [c.lower() for c in df.columns]
-        logger.debug(f"Fetched {len(df)} {timeframe} bars for {ticker}")
-        return df
-
+        return get_klines(symbol, interval, days=days or DEFAULT_DAYS[timeframe])
     except Exception as e:
-        logger.warning(f"Bar fetch error ({ticker}, {timeframe}): {e}")
+        logger.warning(f"Bar fetch error ({symbol}, {timeframe}): {e}")
         return pd.DataFrame()
 
 
-def fetch_multi_timeframe(ticker: str) -> dict[str, pd.DataFrame]:
+def fetch_multi_timeframe(symbol: str) -> dict[str, pd.DataFrame]:
     """
-    Fetch bars at three timeframes in parallel — the backbone of multi-TF analysis.
+    Fetch 1H and 1D bars concurrently.
 
-    Uses ThreadPoolExecutor so all three Alpaca requests fire simultaneously
-    instead of waiting for each to finish before starting the next.
-    On a 3-ticker watchlist this cuts data-fetch time by ~65%; on 10+ tickers
-    it prevents the 4-minute analysis cycle from falling behind.
-
-    Returns:
-        {
-          '1m':  last 100 1-minute bars,
-          '1h':  last 200 1-hour bars,
-          '1d':  last 200 daily bars,
-        }
-    All may be empty DataFrames if the request fails.
+    Returns {'1h': df, '1d': df}; either may be empty on failure.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    tasks = {
-        '1m': (TimeFrame.Minute, 100),
-        '1h': (TimeFrame.Hour,   300),
-        '1d': (TimeFrame.Day,    200),
-    }
+    labels = ['1h', '1d']
     results: dict[str, pd.DataFrame] = {}
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {
-            pool.submit(fetch_bars, ticker, tf, limit): label
-            for label, (tf, limit) in tasks.items()
-        }
-        for future in as_completed(futures):
-            label = futures[future]
+    with ThreadPoolExecutor(max_workers=len(labels)) as pool:
+        futures = {pool.submit(fetch_bars, symbol, label): label for label in labels}
+        for future, label in futures.items():
             try:
                 results[label] = future.result()
             except Exception as e:
-                logger.warning(f"fetch_multi_timeframe error ({ticker}, {label}): {e}")
+                logger.warning(f"fetch_multi_timeframe error ({symbol}, {label}): {e}")
                 results[label] = pd.DataFrame()
 
     return results
 
 
-def get_current_price(ticker: str) -> float | None:
-    """Fetch the latest trade price for a crypto ticker."""
-    symbol = _to_alpaca_symbol(ticker)
-    try:
-        req = CryptoLatestBarRequest(symbol_or_symbols=symbol)
-        bar = _client.get_crypto_latest_bar(req)
-        return float(bar[symbol].close)
-    except Exception as e:
-        logger.warning(f"Price fetch error ({ticker}): {e}")
-        return None
+def get_current_price(symbol: str) -> float | None:
+    """Latest traded price, or None if unavailable."""
+    return get_last_price(symbol)

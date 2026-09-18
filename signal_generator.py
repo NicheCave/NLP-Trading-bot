@@ -41,9 +41,9 @@ class Signal:
 _EPSILON = 0.001
 
 
-def _in_kill_zone() -> tuple[bool, str]:
+def _in_kill_zone(now: datetime) -> tuple[bool, str]:
     """
-    Check if current UTC time falls within an institutional Kill Zone.
+    Check whether `now` falls within an institutional Kill Zone.
 
     Returns (is_in_zone: bool, zone_label: str).
     'off_hours' label is returned when outside all zones.
@@ -52,8 +52,7 @@ def _in_kill_zone() -> tuple[bool, str]:
     """
     if not config.KILL_ZONES_ENABLED:
         return True, 'disabled'
-    now_utc = datetime.now(timezone.utc)
-    hour    = now_utc.hour
+    hour = now.hour
     for label, start, end in config.KILL_ZONES:
         if start <= hour < end:
             return True, label
@@ -201,8 +200,7 @@ def _should_pyramid(analysis: AnalysisResult) -> bool:
 
 def generate_signal(ticker: str) -> Signal:
     """
-    Run multi-timeframe TA + SMC + Advanced TA analysis and produce a
-    BUY / SELL / HOLD signal with confidence score.
+    Live path: analyse the market and produce a BUY / SELL / HOLD signal.
     """
     # ── v5: loss-streak cooldown ──────────────────────────────
     # Check before doing the (expensive) analysis. If this ticker is on
@@ -220,8 +218,19 @@ def generate_signal(ticker: str) -> Signal:
     except Exception:
         pass  # don't let cooldown errors block analysis
 
-    analysis = analyze(ticker)
+    return signal_from_analysis(ticker, analyze(ticker), datetime.now(timezone.utc))
 
+
+def signal_from_analysis(ticker: str,
+                         analysis: Optional[AnalysisResult],
+                         now: datetime) -> Signal:
+    """
+    Turn an AnalysisResult into a Signal.
+
+    Pure: the only clock input is `now`, passed in explicitly so the
+    backtester can replay historical bars through the identical decision
+    path (kill-zone timing in particular depends on the hour).
+    """
     if analysis is None:
         return Signal(
             ticker, 'HOLD', 0.0, 0.0, 0.0, 0.0, 0,
@@ -271,11 +280,11 @@ def generate_signal(ticker: str) -> Signal:
     # outside these windows get a confidence penalty — not a full veto —
     # because crypto can move violently any hour, but institutional intent
     # is statistically concentrated in the zones.
-    in_zone, zone_label = _in_kill_zone()
+    in_zone, zone_label = _in_kill_zone(now)
     kill_zone_penalty   = 1.0
     if not in_zone:
         kill_zone_penalty = config.KILL_ZONE_OFF_HOURS_PENALTY
-        logger.debug(f"{ticker}: outside kill zones (hour={datetime.now(timezone.utc).hour} UTC) — applying {kill_zone_penalty:.0%} confidence penalty")
+        logger.debug(f"{ticker}: outside kill zones (hour={now.hour} UTC) — applying {kill_zone_penalty:.0%} confidence penalty")
 
     # ── Bear market override ───────────────────────────────────
     in_bear_market = analysis.trend == 'downtrend'

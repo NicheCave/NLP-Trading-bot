@@ -208,7 +208,7 @@ def _get_btc_trend() -> str:
     if cached and (now - ts) < 300:   # 5-min TTL
         return cached
     try:
-        bars = fetch_multi_timeframe('BTCUSD')
+        bars = fetch_multi_timeframe(config.ANCHOR_SYMBOL)
         trend = _trend_from_ema_df(bars.get('1h'))
         _btc_trend_cache['result'] = trend
         _btc_trend_cache['ts']     = now
@@ -225,15 +225,43 @@ def _get_btc_trend() -> str:
 
 def analyze(ticker: str) -> Optional[AnalysisResult]:
     """
-    Run full multi-timeframe analysis for a ticker and return AnalysisResult.
+    Live path: fetch bars, then analyse them.
 
-    Returns None if data is insufficient for a meaningful signal.
+    Kept as a thin wrapper so that analysis itself stays a pure function of
+    its input frames — that is what lets the backtester replay the exact
+    same logic bar by bar without touching the network.
     """
     bars = fetch_multi_timeframe(ticker)
-    df_1m = bars.get('1m')
-    df_1h = bars.get('1h')
-    df_1d = bars.get('1d')
+    btc_trend = None if config.is_anchor(ticker) else _get_btc_trend()
 
+    df_1h = bars.get('1h')
+    # Trim to the same window the backtest replays, so a signal here is the
+    # signal that was measured there.
+    if df_1h is not None and len(df_1h) > config.ANALYSIS_WINDOW_BARS:
+        df_1h = df_1h.iloc[-config.ANALYSIS_WINDOW_BARS:]
+
+    return analyze_frames(ticker, df_1h, bars.get('1d'), btc_trend)
+
+
+def analyze_frames(ticker: str,
+                   df_1h,
+                   df_1d=None,
+                   btc_trend: Optional[str] = None) -> Optional[AnalysisResult]:
+    """
+    Run the full indicator stack over already-fetched frames.
+
+    Pure: no network, no clock. Every frame passed in must contain only bars
+    that had CLOSED at the moment being analysed — the caller owns that
+    guarantee, and it is what keeps the backtest honest.
+
+    Args:
+        ticker:    symbol under analysis
+        df_1h:     1H bars, ascending, most recent bar closed
+        df_1d:     1D bars (optional) for higher-timeframe confluence
+        btc_trend: anchor trend, or None for the anchor symbol itself
+
+    Returns None when there isn't enough data for a meaningful read.
+    """
     # Need at least 1H data to do anything meaningful
     if df_1h is None or df_1h.empty or len(df_1h) < 30:
         logger.warning(f"Insufficient 1H data for {ticker} — skipping analysis")
@@ -721,8 +749,7 @@ def analyze(ticker: str) -> Optional[AnalysisResult]:
     # BTC itself skips this check — it IS the anchor.
     btc_anchor_bullish = True   # default: assume fine
     try:
-        if ticker != 'BTCUSD':
-            btc_trend = _get_btc_trend()
+        if not config.is_anchor(ticker) and btc_trend is not None:
             btc_anchor_bullish = (btc_trend != 'downtrend')
             if btc_trend == 'uptrend':
                 votes.append(IndicatorVote(

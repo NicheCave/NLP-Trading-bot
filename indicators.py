@@ -968,3 +968,173 @@ def elliott_divergence(df: pd.DataFrame,
         price_high=last_swing[1],
         rsi_at_high=last_swing[2],
     )
+
+# ══════════════════════════════════════════════════════════════
+# v7: REGIME INDICATORS
+# ══════════════════════════════════════════════════════════════
+# These do not vote on direction. Their job is to say what KIND of market
+# we are in, so the signal layer can pick which logic to trust. Running a
+# trend-following model inside a range is the single largest source of
+# avoidable losses in the existing stack.
+
+
+@dataclass
+class ADXResult:
+    adx:      float
+    plus_di:  float
+    minus_di: float
+    trending: bool     # ADX above the threshold
+    bullish:  bool     # +DI > -DI
+
+
+def adx(df: pd.DataFrame, period: int = 14, threshold: float = 22.0) -> Optional[ADXResult]:
+    """
+    Average Directional Index — trend STRENGTH, not direction.
+
+    Wilder's original: ADX below ~20-25 means no trend worth following.
+    Used as the primary gate for the trend/range decision.
+    """
+    if len(df) < period * 3:
+        return None
+
+    high, low, close = df['high'], df['low'], df['close']
+    prev_close = close.shift(1)
+
+    tr = pd.concat([high - low,
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs()], axis=1).max(axis=1)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    # Wilder smoothing is an EMA with alpha = 1/period.
+    atr_w = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_w
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_w
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx_series = dx.ewm(alpha=1 / period, adjust=False).mean()
+
+    value = float(adx_series.iloc[-1])
+    if not np.isfinite(value):
+        return None
+
+    p_di, m_di = float(plus_di.iloc[-1]), float(minus_di.iloc[-1])
+    return ADXResult(adx=value, plus_di=p_di, minus_di=m_di,
+                     trending=value >= threshold, bullish=p_di > m_di)
+
+
+@dataclass
+class EfficiencyResult:
+    ratio:    float    # 0 = pure noise, 1 = a straight line
+    trending: bool
+
+
+def efficiency_ratio(df: pd.DataFrame, period: int = 20,
+                     threshold: float = 0.35) -> Optional[EfficiencyResult]:
+    """
+    Kaufman Efficiency Ratio: net movement divided by total path length.
+
+    A market that travels 100 points to end 100 points higher scores 1.0;
+    one that thrashes 500 points to end 100 higher scores 0.2. It separates
+    "moving" from "going somewhere" — which ADX alone can be slow to do.
+    """
+    if len(df) < period + 1:
+        return None
+
+    close = df['close']
+    net = abs(float(close.iloc[-1]) - float(close.iloc[-period - 1]))
+    path = float(close.diff().abs().tail(period).sum())
+    if path <= 0:
+        return None
+
+    ratio = net / path
+    return EfficiencyResult(ratio=ratio, trending=ratio >= threshold)
+
+
+@dataclass
+class VolatilityResult:
+    realised:   float   # annualised realised vol
+    percentile: float   # 0-1 rank within the lookback window
+    regime:     str     # 'low' | 'normal' | 'high'
+
+
+def realised_volatility(df: pd.DataFrame, period: int = 24,
+                        lookback: int = 720,
+                        bars_per_year: int = 24 * 365) -> Optional[VolatilityResult]:
+    """
+    Annualised realised volatility, plus where it sits in its own history.
+
+    The percentile matters more than the level: "high vol for this asset,
+    lately" is actionable, whereas an absolute number means different things
+    for BTC and SOL.
+    """
+    if len(df) < period + 10:
+        return None
+
+    returns = df['close'].pct_change()
+    rolling = returns.rolling(period).std() * np.sqrt(bars_per_year)
+    current = float(rolling.iloc[-1])
+    if not np.isfinite(current):
+        return None
+
+    history = rolling.tail(lookback).dropna()
+    percentile = float((history < current).mean()) if len(history) > 20 else 0.5
+
+    if percentile >= 0.80:
+        regime = 'high'
+    elif percentile <= 0.20:
+        regime = 'low'
+    else:
+        regime = 'normal'
+
+    return VolatilityResult(realised=current, percentile=percentile, regime=regime)
+
+
+@dataclass
+class SqueezeResult:
+    squeezed:  bool     # Bollinger Bands inside Keltner Channels
+    bandwidth: float    # BB width as a fraction of price
+    released:  bool     # squeeze ended on this bar — expansion beginning
+
+
+def squeeze(df: pd.DataFrame, bb_period: int = 20, bb_std: float = 2.0,
+            kc_period: int = 20, kc_mult: float = 1.5) -> Optional[SqueezeResult]:
+    """
+    Bollinger/Keltner squeeze — volatility compression before expansion.
+
+    When BBs contract inside the Keltner Channels the market is coiling.
+    The release is what's tradeable; entering during the squeeze itself is
+    how a range-bound system bleeds.
+    """
+    if len(df) < max(bb_period, kc_period) + 5:
+        return None
+
+    close, high, low = df['close'], df['high'], df['low']
+    basis = close.rolling(bb_period).mean()
+    dev = close.rolling(bb_period).std(ddof=0) * bb_std
+    bb_upper, bb_lower = basis + dev, basis - dev
+
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low,
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs()], axis=1).max(axis=1)
+    kc_atr = tr.rolling(kc_period).mean()
+    kc_basis = close.rolling(kc_period).mean()
+    kc_upper, kc_lower = kc_basis + kc_mult * kc_atr, kc_basis - kc_mult * kc_atr
+
+    inside = (bb_upper < kc_upper) & (bb_lower > kc_lower)
+    if inside.iloc[-1] != inside.iloc[-1]:      # NaN guard
+        return None
+
+    now_squeezed = bool(inside.iloc[-1])
+    was_squeezed = bool(inside.iloc[-2]) if len(inside) > 1 else False
+    price = float(close.iloc[-1])
+
+    return SqueezeResult(
+        squeezed=now_squeezed,
+        bandwidth=float((bb_upper.iloc[-1] - bb_lower.iloc[-1]) / price) if price else 0.0,
+        released=was_squeezed and not now_squeezed,
+    )

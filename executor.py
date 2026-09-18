@@ -1,695 +1,408 @@
-# executor.py — risk-managed order placement via Alpaca (v3)
+# executor.py — risk-managed order placement for Bybit perpetuals (v7).
 # ─────────────────────────────────────────────────────────────
-# Changes from v2 (Bellafiore pyramiding + Elliott Wave caution):
+# Rewritten against the Broker interface. What changed from the Alpaca
+# version, and why each mattered:
 #
-#   - scale_in_winner(): NEW — adds 50% more size to an already-profitable
-#     position when signal.add_to_winner is True AND unrealized P&L >= 1 ATR.
-#     Implements Bellafiore's "One Good Trade" load-the-boat logic:
-#     enter at 50% on the initial signal, add the other 50% only when the
-#     trade proves itself.
+#   Shorts are real          SELL used to mean "close the long, if any";
+#                            half the indicator stack voted into the void.
+#   Sizing is risk-based     see risk.py — the old rule risked 1/20th of
+#                            what it claimed.
+#   Stops live on the venue  attached to the entry order, so a crashed bot
+#                            or a gapped candle can't leave a leveraged
+#                            position unprotected.
+#   Price-based exit maths   Bybit's unrealised % is a percentage of MARGIN;
+#                            comparing it to a price-based target fires the
+#                            exit leverage-times too early.
+#   Symmetric trailing       the old trailing stop only tracked highs.
 #
-#   - execute_signal(): now checks signal.wave5_caution and halves
-#     CRYPTO_RISK_PER_TRADE for that trade if the Elliott Wave 5 warning
-#     is active. This reduces position size automatically — no manual override.
-#
-#   - execute_signal(): now checks signal.add_to_winner and calls
-#     scale_in_winner() instead of placing a duplicate full-size buy.
-#
-#   - All other logic preserved from v2 (3-layer duplicate guard, daily
-#     sync on DAILY_SYNC_INTERVAL, crypto stop-loss via check_exits).
+# Local polling is now a SAFETY NET for the things the exchange can't know
+# about — time stops, funding-driven exits, and trailing amendments — not
+# the primary protection mechanism.
 # ─────────────────────────────────────────────────────────────
-import alpaca_trade_api as tradeapi
-from loguru import logger
-from datetime import date, datetime, timezone
-import config
-from signal_generator import Signal
-from config import is_crypto, to_order_symbol
-from alpaca.data.historical.crypto import CryptoHistoricalDataClient
-from alpaca.data.requests import CryptoLatestBarRequest
+from __future__ import annotations
+
 import json
 import os
+from dataclasses import asdict, dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional
+
+from loguru import logger
+
+import config
+import risk
+from brokers.base import Broker, BrokerError, BrokerPosition
 
 STATE_FILE = "logs/executor_state.json"
-import pandas as pd
-
-_pending_buys: set[str] = set()
-
-# v4: tracks entry timestamp per ticker for time-based stops
-_entry_times: dict[str, datetime] = {}
-
-# v4: trailing stop state — highest price seen since entry per ticker
-_trailing_highs: dict[str, float] = {}
-
-# v5: tracks symbols for which a TP/SL/time/trail sell has already been
-# submitted but not yet confirmed filled. Persisted across restarts so a
-# crash mid-exit doesn't cause a duplicate exit on the next boot.
-_pending_exits: set[str] = set()
-
-# v5: pyramid storm guard — last time we scaled into each ticker.
-# Prevents scale_in_winner from firing every 20s while the cached
-# add_to_winner=True signal is still alive.
-_last_pyramid: dict[str, datetime] = {}
-
-# v5: loss-streak cooldown state.
-# _recent_outcomes: ticker → most-recent-first list of 'win'/'loss'.
-# _cooldown_until:  ticker → datetime (UTC) before which BUYs are blocked.
-_recent_outcomes: dict[str, list[str]] = {}
-_cooldown_until:  dict[str, datetime]   = {}
-
-_crypto_client = CryptoHistoricalDataClient(
-    api_key=config.ALPACA_API_KEY,
-    secret_key=config.ALPACA_SECRET_KEY,
-)
-
-api = tradeapi.REST(
-    config.ALPACA_API_KEY,
-    config.ALPACA_SECRET_KEY,
-    config.ALPACA_BASE_URL,
-    api_version='v2',
-)
-
-# ── Daily trade counter ───────────────────────────────────────
-_today        = date.today()
-_daily_trades = 0
 
 
-def _reset_daily_counter_if_needed():
-    global _today, _daily_trades
-    today = date.today()
-    if today != _today:
-        _today        = today
-        _daily_trades = 0
-        logger.info("New day — daily trade counter reset.")
+@dataclass
+class TradeState:
+    """What we know about an open position that the exchange doesn't."""
+    symbol:      str
+    side:        str
+    entry_price: float
+    entry_time:  str                    # ISO8601 UTC
+    stop_price:  float                  # current stop — moves as it trails
+    take_price:  Optional[float] = None
+    # The stop as placed at entry. R-multiples must be measured against THIS,
+    # never the trailed stop: once a winner trails past entry, entry − stop
+    # is locked-in profit, not risk, and dividing by it understates the
+    # trade — a full 3.9 R take-profit was once logged as 2.5 R this way.
+    initial_stop: Optional[float] = None
+    atr:         float = 0.0
+    confidence:  float = 0.0
+    extreme:     float = 0.0            # best price seen since entry
+    reason:      str = ''
+    tags:        list[str] = field(default_factory=list)
 
-def _save_executor_state():
-    """Persists entry times, trailing highs, pending exits, pyramid timing,
-    recent outcomes, and cooldowns to disk. (v5: pending_exits + cooldown
-    state added so a crash mid-exit doesn't double-fire on restart.)"""
-    try:
-        # Convert datetime objects to ISO strings for JSON compatibility
-        serializable_entries  = {k: v.isoformat() for k, v in _entry_times.items()}
-        serializable_pyramid  = {k: v.isoformat() for k, v in _last_pyramid.items()}
-        serializable_cooldown = {k: v.isoformat() for k, v in _cooldown_until.items()}
-        with open(STATE_FILE, 'w') as f:
-            json.dump({
-                "entry_times":      serializable_entries,
-                "trailing_highs":   _trailing_highs,
-                "pending_exits":    list(_pending_exits),       # v5
-                "last_pyramid":     serializable_pyramid,        # v5
-                "recent_outcomes":  _recent_outcomes,            # v5
-                "cooldown_until":   serializable_cooldown,       # v5
-            }, f)
-    except Exception as e:
-        logger.warning(f"Failed to save executor state: {e}")
+    @property
+    def entered_at(self) -> datetime:
+        return datetime.fromisoformat(self.entry_time)
 
-def _load_executor_state():
-    """Restores state from disk on startup. (v5: also restores pending_exits,
-    pyramid timing, outcomes, cooldowns.)"""
-    global _entry_times, _trailing_highs, _pending_exits
-    global _last_pyramid, _recent_outcomes, _cooldown_until
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, 'r') as f:
-                data = json.load(f)
-                _entry_times = {
-                    k: datetime.fromisoformat(v)
-                    for k, v in data.get("entry_times", {}).items()
-                }
-                _trailing_highs = data.get("trailing_highs", {})
-                _pending_exits  = set(data.get("pending_exits", []))
-                _last_pyramid = {
-                    k: datetime.fromisoformat(v)
-                    for k, v in data.get("last_pyramid", {}).items()
-                }
-                _recent_outcomes = data.get("recent_outcomes", {})
-                _cooldown_until = {
-                    k: datetime.fromisoformat(v)
-                    for k, v in data.get("cooldown_until", {}).items()
-                }
-            logger.info(
-                f"Restored state: {len(_entry_times)} active trades, "
-                f"{len(_pending_exits)} pending exits, "
-                f"{len(_cooldown_until)} cooldowns."
-            )
-        except Exception as e:
-            logger.warning(f"Could not load executor state: {e}")
-
-_load_executor_state()
-
-def sync_daily_counter():
-    """
-    Sync today's filled order count directly from Alpaca.
-    Call on DAILY_SYNC_INTERVAL (main.py). Survives restarts.
-    """
-    global _daily_trades
-    _reset_daily_counter_if_needed()
-    try:
-        today_str = date.today().isoformat()
-        orders    = api.list_orders(
-            status='filled',
-            after=f"{today_str}T00:00:00Z",
-            limit=500,
-        )
-        _daily_trades = len(orders)
-        logger.debug(f"Daily trade counter synced: {_daily_trades} filled orders today")
-    except Exception as e:
-        logger.warning(f"Could not sync daily trade counter: {e}")
+    def hours_held(self, now: Optional[datetime] = None) -> float:
+        now = now or datetime.now(timezone.utc)
+        return (now - self.entered_at).total_seconds() / 3600
 
 
-def get_portfolio_value() -> float:
-    return float(api.get_account().portfolio_value)
+class Executor:
+    """Turns decisions into orders, and manages what happens afterwards."""
 
+    def __init__(self, broker: Broker, on_close=None):
+        self.broker = broker
+        # Called as on_close(TradeState, exit_price, pnl_pct, outcome) whenever
+        # a position ends — including exchange-side stops, which are the normal
+        # exit path now that protection lives at the venue.
+        self.on_close = on_close
+        self.states: dict[str, TradeState] = {}
+        self.daily_trades = 0
+        self._today = date.today()
+        # Epoch-ish default so the first management cycle always polls.
+        self._last_poll = datetime.fromtimestamp(0, tz=timezone.utc)
 
-def get_open_positions() -> list:
-    return api.list_positions()
+        # Loss-streak cooldown, carried over from v5 — it earned its place.
+        self.recent_outcomes: dict[str, list[str]] = {}
+        self.cooldown_until: dict[str, datetime] = {}
 
+        self._load()
 
-def already_in_position(ticker: str) -> bool:
-    try:
-        pos          = api.get_position(ticker)
-        has_position = float(pos.qty) != 0
-        if has_position:
-            _pending_buys.discard(ticker)
-        return has_position
-    except tradeapi.rest.APIError as e:
-        if e.status_code == 404:
+    # ══════════════════════════════════════════════════════════
+    # ENTRY
+    # ══════════════════════════════════════════════════════════
+
+    def open_position(self,
+                      symbol: str,
+                      direction: str,
+                      stop_price: float,
+                      take_price: Optional[float] = None,
+                      atr: float = 0.0,
+                      confidence: float = 0.0,
+                      reason: str = '',
+                      tags: Optional[list[str]] = None) -> bool:
+        """Size, gate and place an entry with exchange-resident protection."""
+        self._roll_day()
+
+        if self.daily_trades >= config.MAX_DAILY_TRADES:
+            logger.warning(f"Daily trade limit reached — skipping {symbol}")
             return False
-        logger.warning(f"API error checking position for {ticker}: {e}")
-        return False
-    except Exception as e:
-        if '404' in str(e):
+
+        if self.is_in_cooldown(symbol):
+            until = self.cooldown_until.get(symbol)
+            logger.warning(f"🧊 {symbol} in cooldown until "
+                           f"{until.strftime('%H:%M UTC') if until else '?'} — skipping")
             return False
-        logger.warning(f"Unexpected error checking position for {ticker}: {e}")
-        return False
 
+        price = self.broker.get_price(symbol)
+        if price is None:
+            logger.warning(f"No price for {symbol} — skipping entry")
+            return False
 
-def has_open_or_pending_buy_order(ticker: str) -> bool:
-    order_symbol = to_order_symbol(ticker)
-    try:
-        open_orders = api.list_orders(status='open', limit=100)
-        for o in open_orders:
-            if o.symbol == order_symbol and o.side == 'buy':
-                logger.debug(f"Found open buy order for {ticker} (id={o.id}) — skipping")
-                return True
-        return False
-    except Exception as e:
-        logger.warning(f"Could not check open orders for {ticker}: {e} — allowing trade")
-        return False
+        # Sanity: the stop must be on the losing side of the entry.
+        if (direction == 'long' and stop_price >= price) or \
+           (direction == 'short' and stop_price <= price):
+            logger.error(f"{symbol}: stop {stop_price} is on the wrong side of "
+                         f"{price} for a {direction} — refusing")
+            return False
 
-
-def is_market_open(ticker: str) -> bool:
-    if is_crypto(ticker):
-        return True
-    clock = api.get_clock()
-    return clock.is_open
-
-
-def _get_current_price(ticker: str, order_symbol: str) -> float | None:
-    """Fetch latest price for a ticker."""
-    if is_crypto(ticker) and '/' not in order_symbol:
-        order_symbol = to_order_symbol(ticker)
-
-    if is_crypto(ticker):
+        # If we can't confirm what we already hold, we must not open anything —
+        # the duplicate-entry guard depends on this list being truthful.
         try:
-            request = CryptoLatestBarRequest(symbol_or_symbols=order_symbol)
-            bar     = _crypto_client.get_crypto_latest_bar(request)
-            return float(bar[order_symbol].close)
-        except Exception as e:
-            logger.warning(f"Price fetch error ({ticker}): {e}")
-            return None
-    else:
-        try:
-            return float(api.get_latest_trade(ticker).price)
-        except Exception as e:
-            logger.warning(f"Price fetch error ({ticker}): {e}")
-            return None
+            positions = self.broker.get_positions()
+        except BrokerError as e:
+            logger.warning(f"Entry for {symbol} aborted — cannot confirm open "
+                           f"positions ({e})")
+            return False
 
-
-_atr_cache: dict[str, tuple[float, float]] = {}  # ticker -> (timestamp, value)
-
-
-def _get_atr_dollars(ticker: str) -> float:
-    """Fetch ATR with a 10-minute cache to reduce API latency."""
-    import time
-    now = time.time()
-    if ticker in _atr_cache:
-        ts, val = _atr_cache[ticker]
-        if (now - ts) < 600:  # 10 minute cache
-            return val
-
-    try:
-        from market_data import fetch_bars
-        from alpaca.data.timeframe import TimeFrame
-        from indicators import atr as calc_atr
-
-        df = fetch_bars(ticker, TimeFrame.Hour, limit=20)
-        if df.empty or len(df) < 15:
-            return 0.0
-
-        result = calc_atr(df, period=config.ATR_PERIOD)
-        val = result.value if result is not None else 0.0
-        _atr_cache[ticker] = (now, val)
-        return val
-    except Exception as e:
-        logger.warning(f"ATR fetch failed for {ticker}: {e}")
-        return 0.0
-
-
-def scale_in_winner(ticker: str, signal: Signal):
-    """
-    Bellafiore Pyramiding: add 50% of the original risk to a winning position.
-
-    Called when:
-    - signal.add_to_winner is True (Alligator eating, AO bullish, AVWAP confirmed, RVOL in-play)
-    - The position is already open and showing unrealized gain >= 1 ATR
-
-    This implements "load the boat" — only adding fuel to a fire that's already burning.
-    The scale-in uses 50% of the normal risk allocation to keep total risk controlled.
-
-    v5 FIX: now respects PYRAMID_MIN_INTERVAL_SEC. Previously this could fire
-    every 20 s while the cached add_to_winner=True signal was alive, turning
-    a 50% add into a 600% add inside one analysis cycle. Now it refuses to
-    re-pyramid the same ticker more than once per analysis cycle.
-    """
-    global _daily_trades
-    _reset_daily_counter_if_needed()
-
-    # ── v5: pyramid storm guard ───────────────────────────────
-    last = _last_pyramid.get(ticker)
-    if last is not None:
-        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
-        if elapsed < config.PYRAMID_MIN_INTERVAL_SEC:
-            logger.debug(
-                f"Scale-in skipped for {ticker} — last pyramid was {elapsed:.0f}s "
-                f"ago (< {config.PYRAMID_MIN_INTERVAL_SEC}s minimum interval)"
-            )
-            return
-
-    limit = config.MAX_DAILY_TRADES_CRYPTO
-    if _daily_trades >= limit:
-        logger.info(f"Scale-in skipped for {ticker} — daily limit reached")
-        return
-
-    order_symbol = to_order_symbol(ticker)
-
-    try:
-        pos = api.get_position(ticker)
-    except Exception:
-        logger.debug(f"Scale-in skipped for {ticker} — no open position found")
-        return
-
-    unrealized_pct = float(pos.unrealized_plpc)
-    current_price  = _get_current_price(ticker, order_symbol)
-    if current_price is None:
-        return
-
-    atr_dollars = _get_atr_dollars(ticker)
-
-    # Bellafiore rule: only pyramid if trade is AT LEAST 1 ATR in profit
-    # This prevents adding to a losing position disguised as a winner.
-    if atr_dollars > 0:
-        atr_pct = atr_dollars / current_price
-        if unrealized_pct < atr_pct:
-            logger.info(
-                f"Scale-in NOT triggered for {ticker} — "
-                f"unrealized={unrealized_pct:.1%} < 1 ATR={atr_pct:.1%}. "
-                f"Waiting for position to prove itself."
-            )
-            return
-    elif unrealized_pct < 0.01:
-        # Fallback: require at least 1% profit before adding
-        logger.info(f"Scale-in skipped for {ticker} — position not profitable enough ({unrealized_pct:.1%})")
-        return
-
-    # Position size: 50% of normal risk (don't double the full position)
-    portfolio   = get_portfolio_value()
-    risk        = config.CRYPTO_RISK_PER_TRADE * 0.50   # half-size add-on
-    dollars     = portfolio * risk * signal.confidence
-
-    if is_crypto(ticker):
-        qty     = round(dollars / current_price, 6)
-        qty_str = str(qty)
-        tif     = 'gtc'
-    else:
-        qty = int(dollars / current_price)
-        if qty < 1:
-            logger.info(f"Scale-in too small for {ticker} — skipping")
-            return
-        qty_str = str(qty)
-        tif     = 'day'
-
-    try:
-        api.submit_order(
-            symbol=order_symbol,
-            qty=qty_str,
-            side='buy',
-            type='market',
-            time_in_force=tif,
+        decision = risk.evaluate_entry(
+            symbol=symbol, side=direction, entry=price, stop=stop_price,
+            equity=self.broker.get_equity(), positions=positions,
+            instrument=self.broker.get_instrument(symbol),
+            available_margin=self.broker.get_available_margin(),
+            confidence=confidence,
         )
-        _daily_trades += 1
-        _last_pyramid[ticker] = datetime.now(timezone.utc)   # v5: storm guard
-        _save_executor_state()
+        if not decision.allowed:
+            logger.info(f"Entry blocked for {symbol}: {decision.reason}")
+            return False
+
+        sizing = decision.sizing
+        result = self.broker.open_position(
+            symbol=symbol, side=direction, qty=sizing.qty,
+            stop_loss=stop_price, take_profit=take_price,
+        )
+        if not result.ok:
+            logger.error(f"Entry failed for {symbol}: {result.error}")
+            return False
+
+        fill = result.filled_price or price
+        self.states[symbol] = TradeState(
+            symbol=symbol, side=direction, entry_price=fill,
+            entry_time=datetime.now(timezone.utc).isoformat(),
+            stop_price=stop_price, take_price=take_price,
+            initial_stop=stop_price,
+            atr=atr, confidence=confidence, extreme=fill,
+            reason=reason, tags=list(tags or []),
+        )
+        self.daily_trades += 1
+        self._save()
+
         logger.success(
-            f"📈 SCALE-IN {qty_str} {ticker} @ ~${current_price:.2f} | "
-            f"unrealized={unrealized_pct:.1%} | "
-            f"conf={signal.confidence:.0%} | Bellafiore pyramiding"
+            f"📈 {direction.upper()} {sizing.qty} {symbol} @ ~{fill:.4f} | "
+            f"risk={sizing.risk_amount:.2f} ({sizing.risk_amount / max(1e-9, self.broker.get_equity()):.2%}) "
+            f"| SL={stop_price:.4f} TP={take_price:.4f} | {reason[:70]}"
         )
-    except Exception as e:
-        logger.error(f"Scale-in order failed for {ticker}: {e}")
+        return True
 
+    # ══════════════════════════════════════════════════════════
+    # EXIT
+    # ══════════════════════════════════════════════════════════
 
-# _pending_exits is declared at the top of this module (see v5 state block).
-# It's persisted across restarts via _save_executor_state / _load_executor_state.
+    def close_position(self, symbol: str, reason: str = 'manual') -> bool:
+        result = self.broker.close_position(symbol)
+        if not result.ok:
+            logger.error(f"Close failed for {symbol}: {result.error}")
+            return False
+        logger.info(f"Closed {symbol} — {reason}")
+        self.states.pop(symbol, None)
+        self._save()
+        return True
 
+    def manage_positions(self, funding_rates: Optional[dict[str, float]] = None) -> None:
+        """
+        Per-cycle maintenance for things the exchange cannot decide.
 
-def check_exits():
-    """Manually enforce take-profit, stop-loss, time stop, and trailing stop for crypto positions."""
-    global _pending_exits
+        The exchange already owns stop-loss and take-profit. This handles
+        trailing amendments, the time stop, and funding-driven exits.
 
-    try:
-        positions = api.list_positions()
-    except Exception as e:
-        logger.warning(f"Could not fetch positions for exit check: {e}")
-        return
+        If the venue can't be reached, the cycle is SKIPPED entirely rather
+        than acted on. Reconciling against an unanswered request would read
+        as "everything closed" and destroy the tracking state for positions
+        that are still open.
+        """
+        # With nothing open there is nothing to manage, so back the polling
+        # right off. The tuned gates keep the bot flat most of the time, and
+        # hammering a flaky demo endpoint every EXIT_INTERVAL seconds for an
+        # answer we already know just manufactures connection errors.
+        if not self.states:
+            elapsed = (datetime.now(timezone.utc) - self._last_poll).total_seconds()
+            if elapsed < config.FLAT_POLL_INTERVAL:
+                return
 
-    # Clear stale pending-exit locks for symbols no longer held
-    current_symbols = {p.symbol for p in positions}
-    stale_count     = len(_pending_exits) - len(_pending_exits & current_symbols)
-    _pending_exits  = {s for s in _pending_exits if s in current_symbols}
-    if stale_count > 0:
-        # A pending exit symbol disappeared from positions → it was filled.
-        # Persist the reduced set so a restart doesn't try to re-exit a closed position.
-        _save_executor_state()
-
-    # v5: sweep orphaned tracking state. When a SELL signal fills (handled via
-    # check_exits no longer seeing the position) we need to release the
-    # entry_times / trailing_highs / last_pyramid records for that ticker.
-    # Build the set of internal tickers that currently have positions.
-    open_internal = set()
-    for p in positions:
-        internal = next(
-            (k for k, v in config.ALPACA_ORDER_SYMBOL.items() if v == p.symbol),
-            p.symbol,
-        )
-        open_internal.add(internal)
-
-    orphans = (set(_entry_times.keys()) - open_internal) | \
-              (set(_trailing_highs.keys()) - open_internal) | \
-              (set(_last_pyramid.keys()) - open_internal)
-    if orphans:
-        for tk in orphans:
-            logger.debug(f"check_exits: cleaning orphaned tracking state for {tk}")
-            _entry_times.pop(tk, None)
-            _trailing_highs.pop(tk, None)
-            _last_pyramid.pop(tk, None)
-            _pending_buys.discard(tk)
-        _save_executor_state()
-
-    for pos in positions:
-        symbol         = pos.symbol
-        unrealized_pct = float(pos.unrealized_plpc)
-
-        internal = next(
-            (k for k, v in config.ALPACA_ORDER_SYMBOL.items() if v == symbol),
-            symbol,
-        )
-
-        take_profit = config.CRYPTO_TAKE_PROFIT_PCT
-        stop = config.CRYPTO_STOP_LOSS_PCT
-
-        # ── Fetch current price (needed for trailing stop) ────
-        price_symbol = to_order_symbol(internal)
-        current_price = _get_current_price(internal, symbol)
-
-        # ── Update trailing high watermark ────────────────────
-        # Every time check_exits() fires, record the highest price
-        # seen since entry. This is what the trailing stop tracks.
-        if current_price is not None:
-            if internal not in _trailing_highs or current_price > _trailing_highs[internal]:
-                _trailing_highs[internal] = current_price
-                _save_executor_state()
-
-        # ── Time-based stop ───────────────────────────────────
-        if internal in _entry_times:
-            hours_held = (datetime.now(timezone.utc) - _entry_times[internal]).total_seconds() / 3600
-            if hours_held >= config.TIME_STOP_HOURS:
-                if symbol not in _pending_exits:
-                    logger.warning(
-                        f"⏱ TIME STOP triggered for {symbol} — "
-                        f"held {hours_held:.1f}h >= {config.TIME_STOP_HOURS}h limit | "
-                        f"P&L={unrealized_pct:.1%}"
-                    )
-                    try:
-                        qty_clean = str(float(pos.qty))
-                        api.submit_order(symbol=symbol, qty=qty_clean, side='sell',
-                                         type='market', time_in_force='gtc')
-                        _pending_exits.add(symbol)
-                        _pending_buys.discard(internal)
-                        _entry_times.pop(internal, None)      # clean up entry time
-                        _trailing_highs.pop(internal, None)   # clean up trailing high
-                        _save_executor_state()                # v5: persist pending exit
-                    except Exception as e:
-                        logger.error(f"Time stop order failed for {symbol}: {e}")
-                continue  # skip the other checks for this position this cycle
-
-        # ── Trailing stop ─────────────────────────────────────
-        if current_price is not None and internal in _trailing_highs:
-            atr_dollars = _get_atr_dollars(internal)
-            if atr_dollars > 0:
-                # Trail distance = 2.0 × ATR below the highest price seen
-                trail_distance = config.TRAILING_ATR_MULTIPLIER * atr_dollars
-                trail_stop_price = _trailing_highs[internal] - trail_distance
-
-                if current_price <= trail_stop_price:
-                    if symbol not in _pending_exits:
-                        logger.warning(
-                            f"📉 TRAILING STOP triggered for {symbol} — "
-                            f"price ${current_price:.2f} crossed below trail stop "
-                            f"${trail_stop_price:.2f} (high=${_trailing_highs[internal]:.2f}, "
-                            f"ATR=${atr_dollars:.2f})"
-                        )
-                        try:
-                            qty_clean = str(float(pos.qty))
-                            api.submit_order(symbol=symbol, qty=qty_clean, side='sell',
-                                             type='market', time_in_force='gtc')
-                            _pending_exits.add(symbol)
-                            _pending_buys.discard(internal)
-                            _entry_times.pop(internal, None)
-                            _trailing_highs.pop(internal, None)
-                            _save_executor_state()            # v5: persist pending exit
-                        except Exception as e:
-                            logger.error(f"Trailing stop order failed for {symbol}: {e}")
-                    continue  # skip fixed TP/SL checks this cycle
-
-        # ── Fixed Take-profit ─────────────────────────────────
-        if unrealized_pct >= take_profit:
-            if symbol in _pending_exits:
-                logger.debug(f"TP sell already pending for {symbol} — skipping duplicate")
-                continue
-            logger.info(f"Take-profit triggered for {symbol} at +{unrealized_pct:.1%}")
-            try:
-                qty_clean = str(float(pos.qty))
-                api.submit_order(symbol=symbol, qty=qty_clean, side='sell',
-                                 type='market', time_in_force='gtc')
-                _pending_exits.add(symbol)
-                _pending_buys.discard(internal)
-                _entry_times.pop(internal, None)
-                _trailing_highs.pop(internal, None)
-                _save_executor_state()                        # v5: persist pending exit
-            except Exception as e:
-                logger.error(f"Take-profit order failed for {symbol}: {e}")
-
-        # ── Fixed Stop-loss ───────────────────────────────────
-        elif unrealized_pct <= -stop:
-            if symbol in _pending_exits:
-                logger.debug(f"SL sell already pending for {symbol} — skipping duplicate")
-                continue
-            logger.info(f"Stop-loss triggered for {symbol} at {unrealized_pct:.1%}")
-            try:
-                qty_clean = str(float(pos.qty))
-                api.submit_order(symbol=symbol, qty=qty_clean, side='sell',
-                                 type='market', time_in_force='gtc')
-                _pending_exits.add(symbol)
-                _pending_buys.discard(internal)
-                _entry_times.pop(internal, None)
-                _trailing_highs.pop(internal, None)
-                _save_executor_state()                        # v5: persist pending exit
-            except Exception as e:
-                logger.error(f"Stop-loss order failed for {symbol}: {e}")
-
-
-def execute_signal(signal: Signal):
-    """Execute a trade signal with full risk management checks."""
-    global _daily_trades
-    _reset_daily_counter_if_needed()
-
-    if signal.action == 'HOLD':
-        logger.info(f"HOLD {signal.ticker} — {signal.reason}")
-        return
-
-    order_symbol = to_order_symbol(signal.ticker)
-
-    # ── SELL PATH ─────────────────────────────────────────────
-    if signal.action == 'SELL':
-        if not already_in_position(signal.ticker):
-            return
-
-        # v5 FIX: don't clear tracking state until the order is confirmed
-        # filled (handled by check_exits when the position disappears from
-        # Alpaca's position list). Clearing it here was a race: a partial
-        # fill or rejection would leave us tracking nothing while still
-        # holding inventory.
         try:
-            pos = api.get_position(signal.ticker)
-            qty_str = str(float(pos.qty))
-
-            api.submit_order(
-                symbol=order_symbol, qty=qty_str, side='sell',
-                type='market', time_in_force='gtc'
-            )
-
-            # Mark this symbol as having a pending exit so check_exits won't
-            # double-fire. The actual state cleanup (entry_times, trailing_highs)
-            # happens when check_exits sees the position is gone.
-            _pending_exits.add(order_symbol)
-            _save_executor_state()
-
-            logger.success(
-                f"✅ SELL {qty_str} {signal.ticker} — technical exit: {signal.reason}"
-            )
-            return
-        except Exception as e:
-            logger.error(f"SELL order failed: {e}")
+            positions = self.broker.get_positions()
+            self._last_poll = datetime.now(timezone.utc)
+        except BrokerError as e:
+            logger.warning(f"Skipping position management — {e}. "
+                           f"Exchange-side stops remain in force.")
             return
 
-    # ── BUY PATH ──────────────────────────────────────────────
-    limit = config.MAX_DAILY_TRADES_CRYPTO
-    if _daily_trades >= limit:
-        logger.warning(f"Daily limit reached — skipping BUY for {signal.ticker}")
-        return
+        self._reconcile(positions)
 
-    # v5: loss-streak cooldown — block fresh BUYs when this ticker is on ice.
-    # Pyramid signals (add_to_winner=True) bypass the cooldown because they
-    # only act on already-open positions; the streak is about new entries.
-    if not signal.add_to_winner and is_in_cooldown(signal.ticker):
-        until = _cooldown_until.get(signal.ticker)
-        logger.warning(
-            f"🧊 COOLDOWN: BUY for {signal.ticker} blocked — "
-            f"{config.LOSS_STREAK_THRESHOLD} consecutive losses, "
-            f"frozen until {until.isoformat() if until else 'unknown'}"
-        )
-        return
+        for symbol, position in positions.items():
+            state = self.states.get(symbol)
+            if state is None:
+                continue
 
-    if already_in_position(signal.ticker):
-        if signal.add_to_winner:
-            scale_in_winner(signal.ticker, signal)
-        return
+            price = position.mark_price or self.broker.get_price(symbol)
+            if not price:
+                continue
 
-    if len(get_open_positions()) >= config.MAX_OPEN_POSITIONS:
-        logger.warning("Max positions reached — skipping BUY")
-        return
-
-    if signal.ticker in _pending_buys or has_open_or_pending_buy_order(signal.ticker):
-        _pending_buys.add(signal.ticker)
-        return
-
-    # Sizing
-    risk = config.CRYPTO_RISK_PER_TRADE
-    if signal.wave5_caution:
-        risk *= 0.50
-        logger.warning(f"⚠ Wave 5 caution — risk reduced to {risk:.2%}")
-
-    price = _get_current_price(signal.ticker, order_symbol)
-    if price is None:
-        return
-
-    portfolio = get_portfolio_value()
-    dollars = portfolio * risk * signal.confidence
-    qty = round(dollars / price, 6) if is_crypto(signal.ticker) else int(dollars / price)
-
-    if qty <= 0:
-        logger.info(f"BUY skipped for {signal.ticker} — qty rounds to 0 (very low confidence)")
-        return
-
-    try:
-        _pending_buys.add(signal.ticker)
-        api.submit_order(symbol=order_symbol, qty=str(qty), side='buy', type='market', time_in_force='gtc')
-
-        # Track for v4 stops
-        _entry_times[signal.ticker] = datetime.now(timezone.utc)
-        _trailing_highs[signal.ticker] = price
-        _daily_trades += 1
-        _save_executor_state()
-
-        logger.success(f"✅ BUY {qty} {signal.ticker} @ ~${price:.2f} | {signal.reason}")
-    except Exception as e:
-        logger.error(f"Order failed: {e}")
-        _pending_buys.discard(signal.ticker)
-
-
-# ══════════════════════════════════════════════════════════════
-# v5: LOSS-STREAK COOLDOWN — public API used by EdgeTracker + signal_generator
-# ══════════════════════════════════════════════════════════════
-
-def register_trade_outcome(ticker: str, outcome: str):
-    """
-    Called from EdgeTracker.record_exit when a trade closes.
-    Tracks per-ticker recent outcomes; if N consecutive losses are seen,
-    sets a cooldown timer that blocks new BUYs on this ticker.
-
-    Args:
-        ticker:  internal ticker e.g. 'BTCUSD'
-        outcome: 'win' or 'loss'
-    """
-    history = _recent_outcomes.setdefault(ticker, [])
-    history.insert(0, outcome)                   # most recent first
-    del history[10:]                             # keep last 10 only
-
-    if outcome == 'loss':
-        # Count leading losses
-        streak = 0
-        for o in history:
-            if o == 'loss':
-                streak += 1
+            # ── track the best price seen, for the trail ──────
+            if position.side == 'long':
+                state.extreme = max(state.extreme or price, price)
             else:
+                state.extreme = min(state.extreme or price, price)
+
+            # ── time stop ─────────────────────────────────────
+            held = state.hours_held()
+            if config.TIME_STOP_HOURS and held >= config.TIME_STOP_HOURS:
+                logger.warning(f"⏱ Time stop for {symbol} — held {held:.1f}h "
+                               f"(P&L {position.pnl_pct_of_price():+.2%})")
+                self.close_position(symbol, 'time_stop')
+                continue
+
+            # ── funding-driven exit ───────────────────────────
+            rate = (funding_rates or {}).get(symbol)
+            if rate is not None and risk.funding_argues_for_exit(position.side, rate):
+                logger.warning(
+                    f"💸 Funding exit for {symbol} — rate {rate:+.4%}/8h against a "
+                    f"{position.side} (≈{rate * 3 * 365:+.0%}/yr carry)")
+                self.close_position(symbol, 'funding')
+                continue
+
+            # ── trailing stop ─────────────────────────────────
+            new_stop = risk.trailing_stop_price(position, state.extreme, state.atr)
+            if new_stop is not None:
+                # Quantise BEFORE deciding whether to send. The exchange
+                # stores prices rounded to the symbol's tick, so a candidate
+                # fractionally above the current stop that rounds to the SAME
+                # tick is a no-op. Bybit rejects those with 34040 "not
+                # modified" — once per management cycle, indefinitely, while
+                # the real stop sits correctly in place the whole time.
+                instrument = self.broker.get_instrument(symbol)
+                quantised = instrument.round_price(new_stop)
+                current = (instrument.round_price(position.stop_loss)
+                           if position.stop_loss is not None else None)
+
+                if current is None or quantised != current:
+                    result = self.broker.set_stops(symbol, stop_loss=quantised)
+                    if result.ok:
+                        logger.info(f"📉 Trail {symbol}: stop {current} → "
+                                    f"{quantised} (extreme {state.extreme:.4f})")
+                        state.stop_price = quantised
+
+        self._save()
+
+    def _reconcile(self, positions: dict[str, BrokerPosition]) -> None:
+        """
+        Detect positions the exchange closed behind our back.
+
+        With stops living at the venue this is the NORMAL exit path, not an
+        edge case: the position simply disappears between polls. Anything we
+        still track but the exchange doesn't must be released.
+        """
+        for symbol in list(self.states):
+            if symbol in positions:
+                continue
+
+            state = self.states.pop(symbol)
+
+            # The real fill, not the price at the moment we happened to look.
+            exit_info = None
+            try:
+                exit_info = self.broker.get_last_exit(symbol, state.entered_at)
+            except Exception as e:
+                logger.debug(f"get_last_exit({symbol}) failed: {e}")
+            if exit_info:
+                price, closed_at = exit_info
+            else:
+                price = self.broker.get_price(symbol) or state.entry_price
+                closed_at = datetime.now(timezone.utc)
+                logger.warning(f"{symbol}: actual exit unavailable — recording "
+                               f"current price {price}, which may differ from the fill")
+
+            move = (price - state.entry_price) / state.entry_price
+            pnl_pct = move if state.side == 'long' else -move
+            outcome = 'win' if pnl_pct > 0 else 'loss'
+
+            logger.info(
+                f"{'✅' if outcome == 'win' else '❌'} {symbol} closed at the exchange "
+                f"— {pnl_pct:+.2%} ({outcome})")
+            self.register_outcome(symbol, outcome)
+
+            if self.on_close is not None:
+                try:
+                    self.on_close(state, price, pnl_pct, outcome, closed_at=closed_at)
+                except Exception as e:
+                    logger.warning(f"on_close hook failed for {symbol}: {e}")
+
+        self._save()
+
+    # ══════════════════════════════════════════════════════════
+    # LOSS-STREAK COOLDOWN
+    # ══════════════════════════════════════════════════════════
+
+    def register_outcome(self, symbol: str, outcome: str) -> None:
+        """Track consecutive losses and freeze the symbol after a streak."""
+        history = self.recent_outcomes.setdefault(symbol, [])
+        history.insert(0, outcome)
+        del history[10:]
+
+        if outcome == 'win':
+            if self.cooldown_until.pop(symbol, None):
+                logger.info(f"❄ Cooldown cleared for {symbol} — a win resets the streak")
+            self._save()
+            return
+
+        streak = 0
+        for entry in history:
+            if entry != 'loss':
                 break
+            streak += 1
 
         if streak >= config.LOSS_STREAK_THRESHOLD:
-            until = datetime.now(timezone.utc) + \
-                    pd.Timedelta(hours=config.LOSS_STREAK_COOLDOWN_HRS)
-            _cooldown_until[ticker] = until
-            logger.warning(
-                f"🧊 COOLDOWN ENGAGED for {ticker}: {streak} consecutive losses "
-                f"→ no new BUYs until {until.strftime('%Y-%m-%d %H:%M UTC')}"
-            )
+            until = datetime.now(timezone.utc) + timedelta(hours=config.LOSS_STREAK_COOLDOWN_HRS)
+            self.cooldown_until[symbol] = until
+            logger.warning(f"🧊 Cooldown for {symbol}: {streak} consecutive losses "
+                           f"→ frozen until {until.strftime('%Y-%m-%d %H:%M UTC')}")
+        self._save()
 
-    elif outcome == 'win':
-        # A win clears the cooldown on this ticker
-        if ticker in _cooldown_until:
-            logger.info(f"❄ COOLDOWN CLEARED for {ticker} — winning trade resets the streak")
-            _cooldown_until.pop(ticker, None)
+    def is_in_cooldown(self, symbol: str) -> bool:
+        until = self.cooldown_until.get(symbol)
+        if until is None:
+            return False
+        if datetime.now(timezone.utc) >= until:
+            self.cooldown_until.pop(symbol, None)
+            self._save()
+            return False
+        return True
 
-    _save_executor_state()
+    # ══════════════════════════════════════════════════════════
+    # STATE
+    # ══════════════════════════════════════════════════════════
 
+    def _roll_day(self) -> None:
+        today = date.today()
+        if today != self._today:
+            self._today = today
+            self.daily_trades = 0
+            logger.info("New day — daily trade counter reset")
 
-def is_in_cooldown(ticker: str) -> bool:
-    """Return True if this ticker is currently frozen by a loss streak."""
-    until = _cooldown_until.get(ticker)
-    if until is None:
-        return False
-    if datetime.now(timezone.utc) >= until:
-        # Cooldown expired — clean up
-        _cooldown_until.pop(ticker, None)
-        _save_executor_state()
-        return False
-    return True
+    def _save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            with open(STATE_FILE, 'w') as f:
+                json.dump({
+                    'states': {s: asdict(v) for s, v in self.states.items()},
+                    'recent_outcomes': self.recent_outcomes,
+                    'cooldown_until': {s: t.isoformat() for s, t in self.cooldown_until.items()},
+                    'daily_trades': self.daily_trades,
+                    'today': self._today.isoformat(),
+                }, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save executor state: {e}")
 
-
-def clear_tracking_state(ticker: str):
-    """Resets v4 + v5 trade-state. Call when a trade is fully closed (position
-    no longer in Alpaca's position list)."""
-    _entry_times.pop(ticker, None)
-    _trailing_highs.pop(ticker, None)
-    _last_pyramid.pop(ticker, None)         # v5
-    _pending_buys.discard(ticker)
-    _save_executor_state()
+    def _load(self) -> None:
+        if not os.path.exists(STATE_FILE):
+            return
+        try:
+            with open(STATE_FILE) as f:
+                data = json.load(f)
+            self.states = {s: TradeState(**v) for s, v in data.get('states', {}).items()}
+            # State files written before initial_stop existed: the current stop
+            # is the best available proxy, and is exact for any position that
+            # has not yet trailed.
+            for state in self.states.values():
+                if state.initial_stop is None:
+                    state.initial_stop = state.stop_price
+            self.recent_outcomes = data.get('recent_outcomes', {})
+            self.cooldown_until = {
+                s: datetime.fromisoformat(t)
+                for s, t in data.get('cooldown_until', {}).items()
+            }
+            saved_day = data.get('today')
+            if saved_day == date.today().isoformat():
+                self.daily_trades = data.get('daily_trades', 0)
+            logger.info(f"Restored {len(self.states)} tracked positions, "
+                        f"{len(self.cooldown_until)} cooldowns")
+        except Exception as e:
+            logger.warning(f"Could not load executor state: {e}")

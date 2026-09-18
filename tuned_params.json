@@ -1,0 +1,45 @@
+{
+  "params": {
+    "min_net": 0.5,
+    "min_agreement": 0.9,
+    "counter_trend_min_net": 0.45,
+    "min_active_blocks": 3,
+    "conf_edge_weight": 6.0,
+    "conf_agree_weight": 3.0,
+    "conf_bias": 1.9,
+    "confidence_floor": 0.25,
+    "atr_stop_mult": 1.8,
+    "atr_target_mult": 7.0,
+    "use_btc_anchor": true,
+    "use_funding_gate": true,
+    "funding_extreme_z": 1.8,
+    "trade_squeeze": false,
+    "use_kill_zones": true
+  },
+  "metadata": {
+    "oos_expectancy_r": 0.05777078004068683,
+    "oos_expectancy_se": 0.0597724993685531,
+    "oos_expectancy_t": 0.9665110318455348,
+    "oos_win_rate": 49.602122015915114,
+    "oos_trades": 377,
+    "overfit_gap": 0.13771712577087897,
+    "windows": 8,
+    "stability": {
+      "min_net": 0.75,
+      "min_agreement": 0.625,
+      "counter_trend_min_net": 0.75,
+      "min_active_blocks": 0.625,
+      "conf_edge_weight": 1.0,
+      "conf_agree_weight": 1.0,
+      "conf_bias": 0.5,
+      "confidence_floor": 1.0,
+      "atr_stop_mult": 0.625,
+      "atr_target_mult": 0.5,
+      "use_btc_anchor": 1.0,
+      "use_funding_gate": 0.625,
+      "funding_extreme_z": 1.0,
+      "trade_squeeze": 1.0,
+      "use_kill_zones": 0.625
+    }
+  }
+}
