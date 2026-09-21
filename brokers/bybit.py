@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -30,15 +31,30 @@ except ImportError:  # pragma: no cover
     HTTP = None
 
 
-# Bybit reports "you asked for the setting it already has" as an error.
-# These codes mean the account is already in the desired state.
-_ALREADY_SET_CODES = {
+# Bybit reports "you asked for the setting it already has" as an error, with a
+# code that depends on the endpoint. Each settings call names its own codes,
+# matched exactly against retCode, and nothing else inherits them: an order
+# rejection must never read as success. 10001 used to be listed here, but it
+# is Bybit's generic parameter error, so rejected orders were logged as fills.
+_LEVERAGE_UNCHANGED = frozenset({
     110043,   # leverage not modified
-    110026,   # margin mode not modified
     34036,    # leverage not modified (unified account)
+})
+_MARGIN_MODE_UNCHANGED = frozenset({
+    110026,   # margin mode not modified
+})
+_STOPS_UNCHANGED = frozenset({
     34040,    # trading stop not modified (SL/TP already at this value)
-    10001,    # position mode not modified (context-dependent)
-}
+})
+
+
+def _ret_code(error: Exception) -> Optional[int]:
+    """Bybit's retCode from a pybit exception, which carries it as status_code."""
+    code = getattr(error, 'status_code', None)
+    if isinstance(code, int):
+        return code
+    match = re.search(r'ErrCode: (\d+)', str(error))
+    return int(match.group(1)) if match else None
 
 
 class _PybitToLoguru(logging.Handler):
@@ -165,30 +181,32 @@ class BybitFuturesBroker(Broker):
     def _ok(response: dict) -> bool:
         return response.get('retCode') == 0
 
-    @staticmethod
-    def _benign(response: dict) -> bool:
-        """True when an 'error' just means the setting was already correct."""
-        return response.get('retCode') in _ALREADY_SET_CODES
+    def _call(self, fn, benign: frozenset = frozenset(),
+              **kwargs) -> tuple[bool, dict]:
+        """
+        Invoke a pybit method, normalising exceptions into (ok, payload).
 
-    def _call(self, fn, **kwargs) -> tuple[bool, dict]:
-        """Invoke a pybit method, normalising exceptions into (ok, payload)."""
+        benign: retCodes meaning "already in the desired state" for THIS
+        endpoint, which count as success. Empty unless the caller opts in.
+        """
         try:
             response = fn(**kwargs)
-            if self._ok(response):
-                return True, response.get('result', {}) or {}
-            logger.warning(f"Bybit {fn.__name__} → {response.get('retCode')} "
-                           f"{response.get('retMsg')}")
-            return False, response
         except Exception as e:
-            message = str(e)
-            # pybit RAISES on a non-zero retCode rather than returning it, so
-            # "already in the desired state" responses land here and never
-            # reach _benign(). Without this they are logged as errors.
-            if any(str(code) in message for code in _ALREADY_SET_CODES):
-                logger.debug(f"Bybit {fn.__name__}: {message}")
+            # pybit RAISES on a non-zero retCode rather than returning it.
+            code = _ret_code(e)
+            if code in benign:
+                logger.debug(f"Bybit {fn.__name__}: already set ({code})")
                 return True, {}
-            logger.error(f"Bybit {fn.__name__} raised: {message}")
-            return False, {'retMsg': message}
+            logger.error(f"Bybit {fn.__name__} raised: {e}")
+            return False, {'retCode': code, 'retMsg': str(e)}
+
+        if self._ok(response):
+            return True, response.get('result', {}) or {}
+        if response.get('retCode') in benign:
+            return True, {}
+        logger.warning(f"Bybit {fn.__name__} → {response.get('retCode')} "
+                       f"{response.get('retMsg')}")
+        return False, response
 
     # ── account ───────────────────────────────────────────────
     def get_equity(self) -> float:
@@ -316,6 +334,11 @@ class BybitFuturesBroker(Broker):
         ok, result = self._call(self.session.place_order, **params)
         if not ok:
             return OrderResult(False, error=str(result.get('retMsg', result)))
+        if not result.get('orderId'):
+            # An accepted order always carries an id. Counting anything else as
+            # a fill would make the executor track a position that doesn't exist.
+            logger.error(f"Bybit returned no order id for {symbol} — treating as rejected")
+            return OrderResult(False, error='no order id returned')
 
         logger.success(
             f"✅ OPEN {side.upper()} {qty} {symbol} @ ~{price} | "
@@ -348,6 +371,9 @@ class BybitFuturesBroker(Broker):
         )
         if not ok:
             return OrderResult(False, error=str(result.get('retMsg', result)))
+        if not result.get('orderId'):
+            logger.error(f"Bybit returned no order id closing {symbol} — treating as rejected")
+            return OrderResult(False, error='no order id returned')
 
         logger.success(f"✅ CLOSE {close_qty} {symbol} ({position.side})")
         return OrderResult(True, order_id=result.get('orderId'))
@@ -373,27 +399,21 @@ class BybitFuturesBroker(Broker):
             params['takeProfit'] = str(instrument.round_price(take_profit))
             params['tpTriggerBy'] = config.TRIGGER_PRICE_TYPE
 
-        ok, result = self._call(self.session.set_trading_stop, **params)
-        if not ok and not self._benign(result):
+        ok, result = self._call(self.session.set_trading_stop,
+                                benign=_STOPS_UNCHANGED, **params)
+        if not ok:
             return OrderResult(False, error=str(result.get('retMsg', result)))
         return OrderResult(True)
 
     # ── venue metadata ────────────────────────────────────────
     def set_leverage(self, symbol: str, leverage: float) -> bool:
-        try:
-            response = self.session.set_leverage(
-                category=config.CATEGORY,
-                symbol=symbol,
-                buyLeverage=str(leverage),
-                sellLeverage=str(leverage),
-            )
-            return self._ok(response) or self._benign(response)
-        except Exception as e:
-            # pybit raises on non-zero retCode; "not modified" is success.
-            if any(str(code) in str(e) for code in _ALREADY_SET_CODES):
-                return True
-            logger.warning(f"set_leverage({symbol}) failed: {e}")
-            return False
+        ok, _ = self._call(self.session.set_leverage,
+                           benign=_LEVERAGE_UNCHANGED,
+                           category=config.CATEGORY,
+                           symbol=symbol,
+                           buyLeverage=str(leverage),
+                           sellLeverage=str(leverage))
+        return ok
 
     def get_instrument(self, symbol: str) -> Instrument:
         return get_instrument(symbol)
@@ -434,7 +454,7 @@ class BybitFuturesBroker(Broker):
                 )
             except Exception as e:
                 # Already-set is the common case and is not a failure.
-                if not any(str(code) in str(e) for code in _ALREADY_SET_CODES):
+                if _ret_code(e) not in _MARGIN_MODE_UNCHANGED:
                     logger.debug(f"switch_margin_mode({symbol}): {e}")
 
             if self.set_leverage(symbol, config.LEVERAGE):

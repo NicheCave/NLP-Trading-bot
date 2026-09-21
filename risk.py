@@ -138,6 +138,16 @@ def size_position(equity: float,
         logger.debug(f"size capped by {leverage}× leverage — risk reduced to "
                      f"{risk_amount / equity:.2%} of equity")
 
+    # Bybit rejects a market order above the symbol's maximum size. Past it the
+    # position is capped and simply risks less than the budget. Only large
+    # accounts reach it: SUIUSDT caps out around $170k of equity.
+    max_qty = float(instrument.max_order_qty)
+    if qty > max_qty:
+        qty = max_qty
+        logger.info(f"{instrument.symbol}: size capped at the exchange maximum of "
+                    f"{max_qty:g} per order — risk reduced to "
+                    f"{qty * stop_distance / equity:.2%} of equity")
+
     qty = instrument.round_qty(qty)
     if qty <= 0:
         return SizingResult(reason=f'qty below min lot {instrument.min_qty}')

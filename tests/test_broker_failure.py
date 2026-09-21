@@ -323,8 +323,8 @@ def test_trail_does_not_resend_an_unchanged_stop(setup, monkeypatch):
 
 def test_already_set_codes_are_not_errors():
     """34040 means 'the stop is already there' — success, not failure."""
-    from brokers.bybit import _ALREADY_SET_CODES
-    assert 34040 in _ALREADY_SET_CODES
+    from brokers.bybit import _STOPS_UNCHANGED
+    assert 34040 in _STOPS_UNCHANGED
 
 
 # ══════════════════════════════════════════════════════════════

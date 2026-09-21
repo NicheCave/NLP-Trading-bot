@@ -137,24 +137,38 @@ class Instrument:
     tick_size:     Decimal
     min_notional:  Decimal
     max_leverage:  float
+    # Market orders have their own, often much smaller, ceiling than limit
+    # orders (SUIUSDT: 66,000 vs max_qty). Every order this bot sends is a
+    # market order, so this is the limit that actually applies.
+    max_mkt_qty:   Optional[Decimal] = None
+
+    @property
+    def max_order_qty(self) -> Decimal:
+        """Largest quantity one market order may carry."""
+        if self.max_mkt_qty is None:
+            return self.max_qty
+        return min(self.max_qty, self.max_mkt_qty)
 
     def round_qty(self, qty: float) -> float:
         """
-        Quantise a quantity DOWN to the nearest valid step.
+        Quantise a quantity DOWN to a whole number of steps.
 
         Always down, never up: rounding up would size the position slightly
         above the risk budget, and repeated across many trades that bias
-        compounds against you.
+        compounds against you. Counts steps rather than using quantize(),
+        which only snaps to decimal places: with a step of 10 it returned
+        130225, which is not a multiple of 10.
         """
-        q = Decimal(str(qty)).quantize(self.qty_step, rounding=ROUND_DOWN)
+        steps = (Decimal(str(qty)) / self.qty_step).to_integral_value(rounding=ROUND_DOWN)
+        q = steps * self.qty_step
         if q < self.min_qty:
             return 0.0
-        return float(min(q, self.max_qty))
+        return float(min(q, self.max_order_qty))
 
     def round_price(self, price: float) -> float:
-        """Quantise a price to the nearest valid tick."""
-        p = Decimal(str(price)).quantize(self.tick_size, rounding=ROUND_HALF_UP)
-        return float(p)
+        """Quantise a price to the nearest whole tick (0.00010 means 0.0001 steps)."""
+        ticks = (Decimal(str(price)) / self.tick_size).to_integral_value(rounding=ROUND_HALF_UP)
+        return float(ticks * self.tick_size)
 
     def is_tradeable(self, qty: float, price: float) -> bool:
         """True when qty clears both the min-lot and min-notional floors."""
@@ -189,11 +203,13 @@ def get_instrument(symbol: str) -> Instrument:
         tick_size=Decimal(prc['tickSize']),
         min_notional=Decimal(lot.get('minNotionalValue', '0')),
         max_leverage=float(info['leverageFilter']['maxLeverage']),
+        max_mkt_qty=Decimal(lot['maxMktOrderQty']) if lot.get('maxMktOrderQty') else None,
     )
     _instrument_cache[symbol] = instrument
     logger.debug(
         f"{symbol}: qtyStep={instrument.qty_step} tick={instrument.tick_size} "
-        f"minNotional={instrument.min_notional} maxLev={instrument.max_leverage}"
+        f"minNotional={instrument.min_notional} maxLev={instrument.max_leverage} "
+        f"maxMktQty={instrument.max_mkt_qty}"
     )
     return instrument
 
